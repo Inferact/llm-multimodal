@@ -162,15 +162,18 @@ impl FetchOutcome {
 
 /// One fetch, as the tracker reports it when the fetch ends: the modality,
 /// where the bytes came from, how it ended, how long the fetch and decode
-/// took, and the bytes it brought in (none when it failed). A part that
-/// repeats another part of the same request is not a fetch and is not
-/// reported.
+/// took, the attempts the fetch took, and the bytes it brought in (none
+/// when it failed). A part that repeats another part of the same request is
+/// not a fetch and is not reported.
 #[derive(Clone, Copy, Debug)]
 pub struct FetchReport {
     pub modality: Modality,
     pub source: FetchSourceKind,
     pub outcome: FetchOutcome,
     pub duration: std::time::Duration,
+    /// The attempts the fetch took: 1 plus the retries its transient
+    /// failures used (see `MediaConnectorConfig::fetch_retries`).
+    pub attempts: u32,
     pub bytes: usize,
 }
 
@@ -400,8 +403,13 @@ impl AsyncMultiModalTracker {
             format!("{config:?}"),
             source,
             move |connector, source| async move {
-                let frame = connector.fetch_image_from(&source, config).await?;
-                Ok(TrackedMedia::Image(frame))
+                let (attempts, frame) = connector.fetch_image_from(&source, config).await;
+                (
+                    attempts,
+                    frame
+                        .map(TrackedMedia::Image)
+                        .map_err(MultiModalError::from),
+                )
             },
         );
     }
@@ -425,8 +433,11 @@ impl AsyncMultiModalTracker {
             format!("{cfg:?}"),
             source,
             move |connector, source| async move {
-                let clip = connector.fetch_video_from(&source, cfg).await?;
-                Ok(TrackedMedia::Video(clip))
+                let (attempts, clip) = connector.fetch_video_from(&source, cfg).await;
+                (
+                    attempts,
+                    clip.map(TrackedMedia::Video).map_err(MultiModalError::from),
+                )
             },
         );
         Ok(())
@@ -439,8 +450,11 @@ impl AsyncMultiModalTracker {
             String::new(),
             source,
             |connector, source| async move {
-                let clip = connector.fetch_audio_from(&source).await?;
-                Ok(TrackedMedia::Audio(clip))
+                let (attempts, clip) = connector.fetch_audio_from(&source).await;
+                (
+                    attempts,
+                    clip.map(TrackedMedia::Audio).map_err(MultiModalError::from),
+                )
             },
         );
     }
@@ -457,7 +471,7 @@ impl AsyncMultiModalTracker {
         fetch: F,
     ) where
         F: FnOnce(Arc<MediaConnector>, Arc<FetchSource>) -> Fut,
-        Fut: Future<Output = MultiModalResult<TrackedMedia>> + Send + 'static,
+        Fut: Future<Output = (u32, MultiModalResult<TrackedMedia>)> + Send + 'static,
     {
         self.uuids.entry(modality).or_default().push(uuid);
 
@@ -471,14 +485,17 @@ impl AsyncMultiModalTracker {
                     reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
                 )]
                 let handle = match &self.fetch_observer {
-                    None => tokio::spawn(fetch(connector, source)),
+                    None => {
+                        let fetching = fetch(connector, source);
+                        tokio::spawn(async move { fetching.await.1 })
+                    }
                     Some((label, observer)) => {
                         let (label, observer) = (Arc::clone(label), *observer);
                         let kind = FetchSourceKind::of(&source);
                         let fetching = fetch(connector, source);
                         tokio::spawn(async move {
                             let started = std::time::Instant::now();
-                            let result = fetching.await;
+                            let (attempts, result) = fetching.await;
                             observer(
                                 &label,
                                 &FetchReport {
@@ -486,6 +503,7 @@ impl AsyncMultiModalTracker {
                                     source: kind,
                                     outcome: FetchOutcome::of(&result),
                                     duration: started.elapsed(),
+                                    attempts,
                                     bytes: result.as_ref().map_or(0, fetched_bytes),
                                 },
                             );
