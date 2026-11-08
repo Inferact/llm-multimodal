@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod cache;
 pub mod data_url;
 pub mod encoder_inputs;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod vision;
 pub mod webp_native;
 
 pub use audio::AudioPreProcessor;
+pub use cache::{CacheKeyQueryDrop, CacheOutcome, MediaBytesCache};
 pub use encoder_inputs::{
     f32_to_bf16_bits, f32_to_f16_bits, EncoderDtype, EncoderInput, EncoderInputView,
     ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,

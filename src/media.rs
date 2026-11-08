@@ -35,6 +35,7 @@ use url::Url;
 
 use crate::{
     audio::decode_audio_mono_f32,
+    cache::{CacheKeyQueryDrop, CacheOutcome, ImageByteCache, MediaBytesCache},
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
     types::TransparencyPolicy,
     video_seek::{FrameTable, SeekPlan, SeekSegment},
@@ -144,6 +145,19 @@ pub struct MediaConnectorConfig {
     /// `None` (or zero) is unlimited, as before. Data URLs, inline bytes
     /// and files take no slot.
     pub max_concurrent_fetches: Option<usize>,
+    /// A shared cache of fetched image bytes (see [`MediaBytesCache`]),
+    /// consulted for images fetched over http(s) only; video and audio
+    /// never touch it. `None` fetches every image from its origin, as
+    /// before.
+    pub image_bytes_cache: Option<Arc<dyn MediaBytesCache>>,
+    /// Which query parameters of an image URL the cache key drops (see
+    /// [`CacheKeyQueryDrop`]); by default every parameter is kept.
+    pub image_cache_query_drop: CacheKeyQueryDrop,
+    /// Whether an image fetched without a cache scope skips the cache. On
+    /// (the default), a request that gives no scope is never served from or
+    /// stored into the cache, so one caller's media can never answer
+    /// another's. Off, such a fetch is keyed under the empty scope.
+    pub image_cache_scope_required: bool,
 }
 
 impl Default for MediaConnectorConfig {
@@ -157,6 +171,9 @@ impl Default for MediaConnectorConfig {
             fetch_retries: 0,
             fetch_retry_backoff: DEFAULT_FETCH_RETRY_BACKOFF,
             max_concurrent_fetches: None,
+            image_bytes_cache: None,
+            image_cache_query_drop: CacheKeyQueryDrop::default(),
+            image_cache_scope_required: true,
         }
     }
 }
@@ -370,6 +387,41 @@ impl FetchSource {
     }
 }
 
+/// How one fetch ran, as the tracker reports it: the attempts it took (1
+/// plus the retries its transient failures used; 0 for a cache hit, which
+/// fetches nothing) and how the image-byte cache figured in it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FetchStats {
+    pub(crate) attempts: u32,
+    pub(crate) cache: CacheOutcome,
+}
+
+impl FetchStats {
+    /// A fetch the cache figured in as a hit.
+    pub(crate) fn hit() -> Self {
+        Self {
+            attempts: 0,
+            cache: CacheOutcome::Hit,
+        }
+    }
+
+    /// A fetch the cache figured in as a miss, in `attempts` attempts.
+    pub(crate) fn miss(attempts: u32) -> Self {
+        Self {
+            attempts,
+            cache: CacheOutcome::Miss,
+        }
+    }
+
+    /// A fetch the cache did not figure in, in `attempts` attempts.
+    pub(crate) fn without_cache(attempts: u32) -> Self {
+        Self {
+            attempts,
+            cache: CacheOutcome::NotUsed,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MediaConnector {
     client: Client,
@@ -383,6 +435,8 @@ pub struct MediaConnector {
     /// The parallel-fetch budget (`max_concurrent_fetches`), one semaphore
     /// for every request this connector serves; `None` is unlimited.
     fetch_slots: Option<Arc<Semaphore>>,
+    /// The shared image-byte cache and its key policy; `None` is no cache.
+    image_cache: Option<ImageByteCache>,
 }
 
 impl MediaConnector {
@@ -415,6 +469,13 @@ impl MediaConnector {
             .max_concurrent_fetches
             .filter(|limit| *limit > 0)
             .map(|limit| Arc::new(Semaphore::new(limit)));
+        let image_cache = config.image_bytes_cache.map(|store| {
+            ImageByteCache::new(
+                store,
+                config.image_cache_query_drop,
+                config.image_cache_scope_required,
+            )
+        });
 
         Ok(Self {
             client,
@@ -426,6 +487,7 @@ impl MediaConnector {
             fetch_retries: config.fetch_retries,
             fetch_retry_backoff: config.fetch_retry_backoff,
             fetch_slots,
+            image_cache,
         })
     }
 
@@ -448,22 +510,29 @@ impl MediaConnector {
         source: MediaSource,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        self.fetch_image_from(&source.into(), cfg).await.1
+        self.fetch_image_from(&source.into(), cfg, None).await.1
     }
 
-    /// The fetch, with the attempts it took (1 plus the retries its
-    /// transient failures used; sources that are not fetched by URL always
-    /// report 1).
+    /// The fetch under the request's cache `scope` (see
+    /// [`AsyncMultiModalTracker::with_cache_scope`]), with how it ran (see
+    /// [`FetchStats`]). Sources that are not fetched by URL never touch the
+    /// cache and always report one attempt.
+    ///
+    /// [`AsyncMultiModalTracker::with_cache_scope`]: crate::tracker::AsyncMultiModalTracker::with_cache_scope
     pub(crate) async fn fetch_image_from(
         &self,
         source: &FetchSource,
         cfg: ImageFetchConfig,
-    ) -> (u32, Result<Arc<ImageFrame>, MediaConnectorError>) {
+        scope: Option<&str>,
+    ) -> (FetchStats, Result<Arc<ImageFrame>, MediaConnectorError>) {
         match source {
-            FetchSource::Url(url) => self.fetch_http_image(url, cfg).await,
-            FetchSource::DataUrl(data_url) => (1, Self::fetch_data_url(data_url, cfg)),
+            FetchSource::Url(url) => self.fetch_http_image(url, cfg, scope).await,
+            FetchSource::DataUrl(data_url) => (
+                FetchStats::without_cache(1),
+                Self::fetch_data_url(data_url, cfg),
+            ),
             FetchSource::InlineBytes(bytes) => (
-                1,
+                FetchStats::without_cache(1),
                 Self::decode_image(
                     bytes.clone(),
                     cfg.detail,
@@ -472,7 +541,10 @@ impl MediaConnector {
                     ImageSource::InlineBytes,
                 ),
             ),
-            FetchSource::File(path) => (1, self.fetch_file(path, cfg).await),
+            FetchSource::File(path) => (
+                FetchStats::without_cache(1),
+                self.fetch_file(path, cfg).await,
+            ),
         }
     }
 
@@ -530,24 +602,22 @@ impl MediaConnector {
         &self,
         url: &str,
         cfg: ImageFetchConfig,
-    ) -> (u32, Result<Arc<ImageFrame>, MediaConnectorError>) {
+        scope: Option<&str>,
+    ) -> (FetchStats, Result<Arc<ImageFrame>, MediaConnectorError>) {
         let parsed = match Url::parse(url) {
             Ok(parsed) => parsed,
-            Err(_) => return (1, Err(MediaConnectorError::InvalidUrl(url.to_string()))),
+            Err(_) => {
+                return (
+                    FetchStats::without_cache(1),
+                    Err(MediaConnectorError::InvalidUrl(url.to_string())),
+                );
+            }
         };
 
         // The slot is held until the decode is done, so the parallel-fetch
         // budget bounds the decoded media in memory too.
         let _slot = self.fetch_slot().await;
-        let (attempts, bytes) = self
-            .fetch_http_bytes_retried(
-                &parsed,
-                self.fetch_timeout,
-                image_max_input_bytes(),
-                "image",
-            )
-            .await;
-        let frame = bytes.and_then(|bytes| {
+        let decode = |bytes: Bytes| {
             Self::decode_image(
                 bytes,
                 cfg.detail,
@@ -557,8 +627,52 @@ impl MediaConnector {
                     url: parsed.to_string(),
                 },
             )
+        };
+        let key = self
+            .image_cache
+            .as_ref()
+            .and_then(|cache| Some((cache.clone(), cache.key(&parsed, scope)?)));
+        let Some((cache, key)) = key else {
+            let (attempts, bytes) = self
+                .fetch_http_bytes_retried(
+                    &parsed,
+                    self.fetch_timeout,
+                    image_max_input_bytes(),
+                    "image",
+                )
+                .await;
+            return (FetchStats::without_cache(attempts), bytes.and_then(decode));
+        };
+
+        // A hit decodes the cached bytes under the same rules as fetched
+        // bytes: the byte cap applies again, and the frame's source stays
+        // the URL, so the frame and its hash are the fetch's.
+        if let Some(bytes) = cache.store.get(&key).await {
+            return (FetchStats::hit(), decode(bytes));
+        }
+        let (attempts, bytes) = self
+            .fetch_http_bytes_retried(
+                &parsed,
+                self.fetch_timeout,
+                image_max_input_bytes(),
+                "image",
+            )
+            .await;
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) => return (FetchStats::miss(attempts), Err(error)),
+        };
+        // Store without waiting for it: a cache that stalls or fails must
+        // not hold the request; a failed write is a lost entry.
+        let (store, put_key, put_bytes) = (cache.store.clone(), key.clone(), bytes.clone());
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the cache write-back is fire-and-forget: the request is answered from the fetch, and the store's own errors are swallowed by the implementation"
+        )]
+        tokio::spawn(async move {
+            store.put(put_key, put_bytes).await;
         });
-        (attempts, frame)
+        (FetchStats::miss(attempts), decode(bytes))
     }
 
     fn fetch_data_url(
