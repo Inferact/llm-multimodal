@@ -23,7 +23,13 @@ use opencv::{
     videoio,
 };
 use reqwest::{header::LOCATION, redirect, Client, StatusCode};
-use tokio::{fs, io::AsyncReadExt, process::Command, task, time};
+use tokio::{
+    fs,
+    io::AsyncReadExt,
+    process::Command,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task, time,
+};
 use tracing::info;
 use url::Url;
 
@@ -97,6 +103,10 @@ pub const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// (30 s against 5 s): under an image-sized budget a clip the engine's own
 /// server answers times out here.
 pub const DEFAULT_VIDEO_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// The backoff unit between a failed fetch and its retry: the retry waits
+/// `fetch_retry_backoff` times the attempt's number, so the first retry
+/// waits one unit, the second two, and so on.
+pub const DEFAULT_FETCH_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct MediaConnectorConfig {
@@ -119,6 +129,21 @@ pub struct MediaConnectorConfig {
     /// Budget for one video fetch by URL, connect to last byte; zero leaves
     /// only the HTTP client's own timeout.
     pub video_fetch_timeout: Duration,
+    /// Extra attempts for an http(s) fetch that failed with a timeout or a
+    /// connection error (the connect itself, or the transfer breaking
+    /// before the last byte); nothing else is retried: not a status the
+    /// origin answered, not a size refusal, not a URL the policy refuses,
+    /// not a decode failure. Each attempt gets the full fetch budget.
+    pub fetch_retries: u32,
+    /// The backoff unit between a failed fetch and its retry: linear, the
+    /// retry waits `fetch_retry_backoff` times the attempt's number.
+    pub fetch_retry_backoff: Duration,
+    /// The most fetches by URL in flight at once over every request this
+    /// connector serves, a slot held from the fetch's start to the end of
+    /// the item's decode so the limit bounds decoded media in memory too.
+    /// `None` (or zero) is unlimited, as before. Data URLs, inline bytes
+    /// and files take no slot.
+    pub max_concurrent_fetches: Option<usize>,
 }
 
 impl Default for MediaConnectorConfig {
@@ -129,6 +154,9 @@ impl Default for MediaConnectorConfig {
             allowed_local_media_path: None,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             video_fetch_timeout: DEFAULT_VIDEO_FETCH_TIMEOUT,
+            fetch_retries: 0,
+            fetch_retry_backoff: DEFAULT_FETCH_RETRY_BACKOFF,
+            max_concurrent_fetches: None,
         }
     }
 }
@@ -350,6 +378,11 @@ pub struct MediaConnector {
     allowed_local_media_path: Option<PathBuf>,
     fetch_timeout: Duration,
     video_fetch_timeout: Duration,
+    fetch_retries: u32,
+    fetch_retry_backoff: Duration,
+    /// The parallel-fetch budget (`max_concurrent_fetches`), one semaphore
+    /// for every request this connector serves; `None` is unlimited.
+    fetch_slots: Option<Arc<Semaphore>>,
 }
 
 impl MediaConnector {
@@ -378,6 +411,11 @@ impl MediaConnector {
             None
         };
 
+        let fetch_slots = config
+            .max_concurrent_fetches
+            .filter(|limit| *limit > 0)
+            .map(|limit| Arc::new(Semaphore::new(limit)));
+
         Ok(Self {
             client,
             policy,
@@ -385,7 +423,24 @@ impl MediaConnector {
             allowed_local_media_path,
             fetch_timeout: config.fetch_timeout,
             video_fetch_timeout: config.video_fetch_timeout,
+            fetch_retries: config.fetch_retries,
+            fetch_retry_backoff: config.fetch_retry_backoff,
+            fetch_slots,
         })
+    }
+
+    /// One slot of the parallel-fetch budget, held from the fetch's start
+    /// to the end of the item's decode; `None` when there is no budget.
+    async fn fetch_slot(&self) -> Option<OwnedSemaphorePermit> {
+        match &self.fetch_slots {
+            Some(slots) => Some(
+                Arc::clone(slots)
+                    .acquire_owned()
+                    .await
+                    .expect("the fetch slots are never closed"),
+            ),
+            None => None,
+        }
     }
 
     pub async fn fetch_image(
@@ -393,25 +448,31 @@ impl MediaConnector {
         source: MediaSource,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        self.fetch_image_from(&source.into(), cfg).await
+        self.fetch_image_from(&source.into(), cfg).await.1
     }
 
+    /// The fetch, with the attempts it took (1 plus the retries its
+    /// transient failures used; sources that are not fetched by URL always
+    /// report 1).
     pub(crate) async fn fetch_image_from(
         &self,
         source: &FetchSource,
         cfg: ImageFetchConfig,
-    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+    ) -> (u32, Result<Arc<ImageFrame>, MediaConnectorError>) {
         match source {
             FetchSource::Url(url) => self.fetch_http_image(url, cfg).await,
-            FetchSource::DataUrl(data_url) => Self::fetch_data_url(data_url, cfg),
-            FetchSource::InlineBytes(bytes) => Self::decode_image(
-                bytes.clone(),
-                cfg.detail,
-                cfg.max_long_side_pixel,
-                cfg.transparency,
-                ImageSource::InlineBytes,
+            FetchSource::DataUrl(data_url) => (1, Self::fetch_data_url(data_url, cfg)),
+            FetchSource::InlineBytes(bytes) => (
+                1,
+                Self::decode_image(
+                    bytes.clone(),
+                    cfg.detail,
+                    cfg.max_long_side_pixel,
+                    cfg.transparency,
+                    ImageSource::InlineBytes,
+                ),
             ),
-            FetchSource::File(path) => self.fetch_file(path, cfg).await,
+            FetchSource::File(path) => (1, self.fetch_file(path, cfg).await),
         }
     }
 
@@ -420,22 +481,24 @@ impl MediaConnector {
         source: MediaSource,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        self.fetch_video_from(&source.into(), cfg).await
+        self.fetch_video_from(&source.into(), cfg).await.1
     }
 
+    /// The fetch, with the attempts it took (see [`Self::fetch_image_from`]).
     pub(crate) async fn fetch_video_from(
         &self,
         source: &FetchSource,
         cfg: VideoFetchConfig,
-    ) -> Result<Arc<VideoClip>, MediaConnectorError> {
+    ) -> (u32, Result<Arc<VideoClip>, MediaConnectorError>) {
         match source {
             FetchSource::Url(url) => self.fetch_http_video(url, cfg).await,
-            FetchSource::DataUrl(data_url) => self.fetch_video_data_url(data_url, cfg).await,
-            FetchSource::InlineBytes(bytes) => {
+            FetchSource::DataUrl(data_url) => (1, self.fetch_video_data_url(data_url, cfg).await),
+            FetchSource::InlineBytes(bytes) => (
+                1,
                 self.decode_video(bytes.clone(), cfg, VideoSource::InlineBytes)
-                    .await
-            }
-            FetchSource::File(path) => self.fetch_video_file(path, cfg).await,
+                    .await,
+            ),
+            FetchSource::File(path) => (1, self.fetch_video_file(path, cfg).await),
         }
     }
 
@@ -443,21 +506,23 @@ impl MediaConnector {
         &self,
         source: MediaSource,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        self.fetch_audio_from(&source.into()).await
+        self.fetch_audio_from(&source.into()).await.1
     }
 
+    /// The fetch, with the attempts it took (see [`Self::fetch_image_from`]).
     pub(crate) async fn fetch_audio_from(
         &self,
         source: &FetchSource,
-    ) -> Result<Arc<AudioClip>, MediaConnectorError> {
+    ) -> (u32, Result<Arc<AudioClip>, MediaConnectorError>) {
         match source {
             FetchSource::Url(url) => self.fetch_http_audio(url).await,
-            FetchSource::DataUrl(data_url) => self.fetch_audio_data_url(data_url).await,
-            FetchSource::InlineBytes(bytes) => {
+            FetchSource::DataUrl(data_url) => (1, self.fetch_audio_data_url(data_url).await),
+            FetchSource::InlineBytes(bytes) => (
+                1,
                 self.decode_audio(bytes.clone(), AudioSource::InlineBytes)
-                    .await
-            }
-            FetchSource::File(path) => self.fetch_audio_file(path).await,
+                    .await,
+            ),
+            FetchSource::File(path) => (1, self.fetch_audio_file(path).await),
         }
     }
 
@@ -465,27 +530,35 @@ impl MediaConnector {
         &self,
         url: &str,
         cfg: ImageFetchConfig,
-    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let parsed =
-            Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
+    ) -> (u32, Result<Arc<ImageFrame>, MediaConnectorError>) {
+        let parsed = match Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(_) => return (1, Err(MediaConnectorError::InvalidUrl(url.to_string()))),
+        };
 
-        let bytes = self
-            .fetch_http_bytes(
+        // The slot is held until the decode is done, so the parallel-fetch
+        // budget bounds the decoded media in memory too.
+        let _slot = self.fetch_slot().await;
+        let (attempts, bytes) = self
+            .fetch_http_bytes_retried(
                 &parsed,
                 self.fetch_timeout,
                 image_max_input_bytes(),
                 "image",
             )
-            .await?;
-        Self::decode_image(
-            bytes,
-            cfg.detail,
-            cfg.max_long_side_pixel,
-            cfg.transparency,
-            ImageSource::Url {
-                url: parsed.to_string(),
-            },
-        )
+            .await;
+        let frame = bytes.and_then(|bytes| {
+            Self::decode_image(
+                bytes,
+                cfg.detail,
+                cfg.max_long_side_pixel,
+                cfg.transparency,
+                ImageSource::Url {
+                    url: parsed.to_string(),
+                },
+            )
+        });
+        (attempts, frame)
     }
 
     fn fetch_data_url(
@@ -587,47 +660,93 @@ impl MediaConnector {
         &self,
         url: &str,
         cfg: VideoFetchConfig,
-    ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let parsed =
-            Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
+    ) -> (u32, Result<Arc<VideoClip>, MediaConnectorError>) {
+        let parsed = match Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(_) => return (1, Err(MediaConnectorError::InvalidUrl(url.to_string()))),
+        };
 
-        let bytes = self
-            .fetch_http_bytes(
+        let _slot = self.fetch_slot().await;
+        let (attempts, bytes) = self
+            .fetch_http_bytes_retried(
                 &parsed,
                 self.video_fetch_timeout,
                 video_max_input_bytes(),
                 "video",
             )
-            .await?;
-        self.decode_video(
-            bytes,
-            cfg,
-            VideoSource::Url {
-                url: parsed.to_string(),
-            },
-        )
-        .await
+            .await;
+        let clip = match bytes {
+            Ok(bytes) => {
+                self.decode_video(
+                    bytes,
+                    cfg,
+                    VideoSource::Url {
+                        url: parsed.to_string(),
+                    },
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        (attempts, clip)
     }
 
-    async fn fetch_http_audio(&self, url: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let parsed =
-            Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
+    async fn fetch_http_audio(
+        &self,
+        url: &str,
+    ) -> (u32, Result<Arc<AudioClip>, MediaConnectorError>) {
+        let parsed = match Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(_) => return (1, Err(MediaConnectorError::InvalidUrl(url.to_string()))),
+        };
 
-        let bytes = self
-            .fetch_http_bytes(
+        let _slot = self.fetch_slot().await;
+        let (attempts, bytes) = self
+            .fetch_http_bytes_retried(
                 &parsed,
                 self.fetch_timeout,
                 audio_max_input_bytes(),
                 "audio",
             )
-            .await?;
-        self.decode_audio(
-            bytes,
-            AudioSource::Url {
-                url: parsed.to_string(),
-            },
-        )
-        .await
+            .await;
+        let clip = match bytes {
+            Ok(bytes) => {
+                self.decode_audio(
+                    bytes,
+                    AudioSource::Url {
+                        url: parsed.to_string(),
+                    },
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        (attempts, clip)
+    }
+
+    /// [`Self::fetch_http_bytes`], retried up to `fetch_retries` times when
+    /// the attempt failed with an error a retry can answer: a timeout or a
+    /// connection error. Before attempt `n` the fetch waits
+    /// `fetch_retry_backoff` times `n`. Returns the attempts it took (1
+    /// plus the retries used) with the last attempt's outcome.
+    async fn fetch_http_bytes_retried(
+        &self,
+        url: &Url,
+        budget: Duration,
+        limit: usize,
+        media: &'static str,
+    ) -> (u32, Result<Bytes, MediaConnectorError>) {
+        let mut attempt = 1;
+        loop {
+            match self.fetch_http_bytes(url, budget, limit, media).await {
+                Ok(bytes) => return (attempt, Ok(bytes)),
+                Err(error) if attempt <= self.fetch_retries && is_retryable(&error) => {
+                    time::sleep(self.fetch_retry_backoff * attempt).await;
+                    attempt += 1;
+                }
+                Err(error) => return (attempt, Err(error)),
+            }
+        }
     }
 
     /// `GET` `url` under `budget`, from connecting to the last byte of the
@@ -922,6 +1041,21 @@ async fn within_budget<T>(
     match remaining {
         Some(remaining) => time::timeout(remaining, future).await.ok(),
         None => Some(future.await),
+    }
+}
+
+/// Whether a failed fetch attempt is tried again: only a timeout or a
+/// connection-level failure (the connect itself, or the transfer breaking
+/// before the last byte) is retried. A status the origin answered, a size
+/// refusal, a URL or policy refusal and a decode failure all stand on the
+/// first attempt.
+fn is_retryable(error: &MediaConnectorError) -> bool {
+    match error {
+        MediaConnectorError::Timeout { .. } => true,
+        MediaConnectorError::Http(error) => {
+            error.is_connect() || error.is_timeout() || error.is_body()
+        }
+        _ => false,
     }
 }
 
