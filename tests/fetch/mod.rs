@@ -5,4 +5,5 @@ mod media_fetch_budget_test;
 mod media_fetch_fault_test;
 mod media_fetch_policy_test;
 mod media_fetch_retry_test;
+mod media_image_cache_test;
 mod multimodal_tracker_test;

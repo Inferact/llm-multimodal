@@ -5,13 +5,14 @@ use tokio::task::JoinHandle;
 use super::{
     error::{MediaConnectorError, MultiModalError, MultiModalResult},
     media::{
-        FetchSource, FrameSampling, ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig,
+        FetchSource, FetchStats, FrameSampling, ImageFetchConfig, MediaConnector, MediaSource,
+        VideoFetchConfig,
     },
     types::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
 };
-use crate::types::TransparencyPolicy;
+use crate::{cache::CacheOutcome, types::TransparencyPolicy};
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
 
@@ -172,8 +173,12 @@ pub struct FetchReport {
     pub outcome: FetchOutcome,
     pub duration: std::time::Duration,
     /// The attempts the fetch took: 1 plus the retries its transient
-    /// failures used (see `MediaConnectorConfig::fetch_retries`).
+    /// failures used (see `MediaConnectorConfig::fetch_retries`); 0 on a
+    /// cache hit, when nothing is fetched.
     pub attempts: u32,
+    /// How the image-byte cache figured in the fetch (see
+    /// [`CacheOutcome`]).
+    pub cache: CacheOutcome,
     pub bytes: usize,
 }
 
@@ -206,6 +211,10 @@ pub struct AsyncMultiModalTracker {
     /// [`TransparencyPolicy`]); `KeepAlpha` unless the request's processing
     /// stage set the destination engine's.
     image_transparency: TransparencyPolicy,
+    /// The scope this request's image fetches key the connector's image-byte
+    /// cache under (the caller's session, say); `None` skips the cache where
+    /// the connector requires a scope.
+    cache_scope: Option<String>,
 }
 
 impl AsyncMultiModalTracker {
@@ -219,7 +228,18 @@ impl AsyncMultiModalTracker {
             default_video_sample_fps: None,
             video_frame_sampling: FrameSampling::default(),
             image_transparency: TransparencyPolicy::KeepAlpha,
+            cache_scope: None,
         }
+    }
+
+    /// Scope this request's image cache keys under `scope` (the caller's
+    /// session ID, say; see `MediaConnectorConfig::image_bytes_cache`).
+    /// `None`, the default, skips the cache for this request's images where
+    /// the connector requires a scope.
+    #[must_use]
+    pub fn with_cache_scope(mut self, scope: Option<String>) -> Self {
+        self.cache_scope = scope;
+        self
     }
 
     /// Decode the request's image frames under `policy` (the destination
@@ -397,15 +417,18 @@ impl AsyncMultiModalTracker {
             max_long_side_pixel,
             transparency: self.image_transparency,
         };
+        let scope = self.cache_scope.clone();
         self.enqueue(
             Modality::Image,
             uuid,
             format!("{config:?}"),
             source,
             move |connector, source| async move {
-                let (attempts, frame) = connector.fetch_image_from(&source, config).await;
+                let (stats, frame) = connector
+                    .fetch_image_from(&source, config, scope.as_deref())
+                    .await;
                 (
-                    attempts,
+                    stats,
                     frame
                         .map(TrackedMedia::Image)
                         .map_err(MultiModalError::from),
@@ -435,7 +458,7 @@ impl AsyncMultiModalTracker {
             move |connector, source| async move {
                 let (attempts, clip) = connector.fetch_video_from(&source, cfg).await;
                 (
-                    attempts,
+                    FetchStats::without_cache(attempts),
                     clip.map(TrackedMedia::Video).map_err(MultiModalError::from),
                 )
             },
@@ -452,7 +475,7 @@ impl AsyncMultiModalTracker {
             |connector, source| async move {
                 let (attempts, clip) = connector.fetch_audio_from(&source).await;
                 (
-                    attempts,
+                    FetchStats::without_cache(attempts),
                     clip.map(TrackedMedia::Audio).map_err(MultiModalError::from),
                 )
             },
@@ -471,7 +494,7 @@ impl AsyncMultiModalTracker {
         fetch: F,
     ) where
         F: FnOnce(Arc<MediaConnector>, Arc<FetchSource>) -> Fut,
-        Fut: Future<Output = (u32, MultiModalResult<TrackedMedia>)> + Send + 'static,
+        Fut: Future<Output = (FetchStats, MultiModalResult<TrackedMedia>)> + Send + 'static,
     {
         self.uuids.entry(modality).or_default().push(uuid);
 
@@ -495,7 +518,7 @@ impl AsyncMultiModalTracker {
                         let fetching = fetch(connector, source);
                         tokio::spawn(async move {
                             let started = std::time::Instant::now();
-                            let (attempts, result) = fetching.await;
+                            let (stats, result) = fetching.await;
                             observer(
                                 &label,
                                 &FetchReport {
@@ -503,7 +526,8 @@ impl AsyncMultiModalTracker {
                                     source: kind,
                                     outcome: FetchOutcome::of(&result),
                                     duration: started.elapsed(),
-                                    attempts,
+                                    attempts: stats.attempts,
+                                    cache: stats.cache,
                                     bytes: result.as_ref().map_or(0, fetched_bytes),
                                 },
                             );
