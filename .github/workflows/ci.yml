@@ -1,3 +1,5 @@
+# Workflow files must change on the default branch for GitHub to register
+# them with Actions; this comment is that registration touch.
 name: CI
 
 on:
