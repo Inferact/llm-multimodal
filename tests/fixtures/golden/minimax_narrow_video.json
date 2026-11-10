@@ -1,5 +1,6 @@
 {
-  "source": "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8/resolve/c5454eb03678d8710e54a4e0fc681b9f3b4a3dba/video_processor.py",
+  "source": "https://raw.githubusercontent.com/vllm-project/vllm/9b9bd049a73617e996d06cf35e6baf2a29ed03ae/vllm/transformers_utils/processors/minimax_m3.py",
+  "source_sha256": "0cd5c6ac89a915c66766a0d4f5facb1adc61856e989d9bf84126e2506fd26054",
   "colors": [
     [
       32,
@@ -18,18 +19,18 @@
       "height": 20,
       "grid": [
         1,
-        2,
-        8
+        12,
+        48
       ],
       "shape": [
-        16,
+        576,
         1176
       ],
       "channel_frame_values": [
         -1.3251129388809204,
         1.4777849912643433,
-        -0.31135138869285583,
-        -0.7915999293327332,
+        -0.3113512694835663,
+        -0.7915999889373779,
         1.7050751447677612,
         -1.2526987791061401
       ]
@@ -39,18 +40,18 @@
       "height": 100,
       "grid": [
         1,
-        8,
-        2
+        48,
+        12
       ],
       "shape": [
-        16,
+        576,
         1176
       ],
       "channel_frame_values": [
         -1.3251129388809204,
         1.4777849912643433,
-        -0.31135138869285583,
-        -0.7915999293327332,
+        -0.3113512694835663,
+        -0.7915999889373779,
         1.7050751447677612,
         -1.2526987791061401
       ]
@@ -60,11 +61,11 @@
       "height": 1,
       "grid": [
         1,
-        4,
-        4
+        12,
+        12
       ],
       "shape": [
-        16,
+        144,
         1176
       ],
       "channel_frame_values": [
@@ -81,11 +82,11 @@
       "height": 28,
       "grid": [
         1,
-        4,
-        4
+        12,
+        12
       ],
       "shape": [
-        16,
+        144,
         1176
       ],
       "channel_frame_values": [
@@ -102,11 +103,11 @@
       "height": 100,
       "grid": [
         1,
-        8,
-        8
+        12,
+        12
       ],
       "shape": [
-        64,
+        144,
         1176
       ],
       "channel_frame_values": [

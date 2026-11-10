@@ -75,9 +75,52 @@ MODELS = {
     "minimax_m3": {
         "model_id": "MiniMaxAI/MiniMax-M3",
         "processor_class": "MiniMaxM3VLImageProcessor",
-        "description": "Qwen2-VL patchify with MiniMax smart resize, CLIP normalization",
+        "description": "Qwen2-VL patchify with the MiniMax-M3.1 aligned long-side resize, CLIP normalization",
     },
 }
+
+# The public MiniMax-M3.1 sizing reference: vLLM's vendored processor
+# (Apache-2.0), whose `compute_aligned_size` mirrors sglang's M3.1 processor.
+# Pinned by commit and verified by digest so a reference change is a
+# deliberate regeneration, not a silent drift.
+MINIMAX_M31_REFERENCE_URL = (
+    "https://raw.githubusercontent.com/vllm-project/vllm/"
+    "9b9bd049a73617e996d06cf35e6baf2a29ed03ae/"
+    "vllm/transformers_utils/processors/minimax_m3.py"
+)
+MINIMAX_M31_REFERENCE_SHA256 = (
+    "0cd5c6ac89a915c66766a0d4f5facb1adc61856e989d9bf84126e2506fd26054"
+)
+
+
+import functools
+
+
+@functools.cache
+def load_minimax_m31_reference():
+    """Download the pinned MiniMax-M3.1 reference processor and import it."""
+    import hashlib
+    import importlib.util
+    import tempfile
+    import urllib.request
+
+    source = urllib.request.urlopen(MINIMAX_M31_REFERENCE_URL).read()
+    digest = hashlib.sha256(source).hexdigest()
+    if digest != MINIMAX_M31_REFERENCE_SHA256:
+        raise RuntimeError(
+            f"MiniMax-M3.1 reference at {MINIMAX_M31_REFERENCE_URL} has sha256 "
+            f"{digest}, expected {MINIMAX_M31_REFERENCE_SHA256}; pin a new "
+            "revision deliberately"
+        )
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "minimax_m3_reference.py"
+        path.write_bytes(source)
+        spec = importlib.util.spec_from_file_location("minimax_m3_reference", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # The module holds no file handles after exec_module; returning it
+        # outlives the temporary directory.
+        return module
 
 # Default test images
 DEFAULT_IMAGES = [
@@ -312,85 +355,31 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     return result
 
 
-# MiniMax-M3's provider scaling contract raises an image whose short side is
-# under 112 px until the short side is exactly 112 px (aspect ratio kept)
-# before the Qwen-style smart resize runs. The hub image_processor.py does not
-# implement the floor, so the generator stages the raise itself, mirroring
-# `MiniMaxM3VisionProcessor::raise_images`.
-MINIMAX_M3_MIN_SHORT_SIDE = 112
-
-
-def minimax_m3_raise_to_short_side_floor(image: Image.Image, max_pixels: int) -> Image.Image:
-    """Raise an image below MiniMax-M3's 112 px short-side floor, as the
-    reference pipeline (and the Rust port) does before the smart resize."""
-    width, height = image.size
-    short = min(width, height)
-    if short == 0 or short >= MINIMAX_M3_MIN_SHORT_SIDE:
-        return image
-    long_side = round(max(width, height) * MINIMAX_M3_MIN_SHORT_SIDE / short)
-    raised = (
-        (MINIMAX_M3_MIN_SHORT_SIDE, long_side)
-        if width <= height
-        else (long_side, MINIMAX_M3_MIN_SHORT_SIDE)
-    )
-    if raised[0] * raised[1] > max_pixels:
-        raise RuntimeError(
-            f"raised image {raised} exceeds max_pixels={max_pixels}; "
-            "port the over-budget staging branch from the Rust processor"
-        )
-    try:
-        # The reference processor is torchvision-backed; raise with the same
-        # uint8 antialias bicubic kernel the Rust staging step matches.
-        import torchvision.transforms.v2.functional as tvF
-
-        tensor = tvF.to_image(image)
-        tensor = tvF.resize(
-            tensor,
-            [raised[1], raised[0]],
-            interpolation=tvF.InterpolationMode.BICUBIC,
-            antialias=True,
-        )
-        return tvF.to_pil_image(tensor)
-    except ImportError:
-        return image.resize(raised, Image.BICUBIC)
-
-
 def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
-    """Generate golden output for MiniMax-M3 VL.
+    """Generate golden output for MiniMax-M3 VL with the M3.1 sizing spec.
 
-    The patchify pipeline is identical to Qwen2-VL, with MiniMax's smart resize
-    defaults:
-    1. Raise images under the 112 px short-side floor (provider contract)
-    2. Smart resize to fit within min/max pixel bounds
-    3. Align dimensions to (patch_size * merge_size) boundary
-    4. Normalize with CLIP mean/std
-    5. Returns image_grid_thw for position encoding
+    The resize is the MiniMax-M3.1 aligned long-side resize from the pinned
+    public reference processor (`load_minimax_m31_reference`, detail "auto"):
+    floor tiny inputs to 168^2 / a 168 short side, round both sides UP to the
+    28 px factor, cap each side at the 2,016 px long side. The patchify
+    pipeline is identical to Qwen2-VL:
+
+    1. Aligned long-side resize onto the (patch_size * merge_size) grid
+    2. Normalize with CLIP mean/std
+    3. Returns image_grid_thw for position encoding
 
     Default parameters:
     - patch_size: 14
     - merge_size: 2
     - temporal_patch_size: 2
-    - min_pixels: 4 * 28 * 28 = 3,136
-    - max_pixels: 672 * 672 = 451,584
     """
-    from transformers import AutoImageProcessor
-
-    # The image processor is registered under AutoImageProcessor in the model's
-    # auto_map; instantiate it directly to avoid the tokenizer dependency of the
-    # full AutoProcessor.
-    img_processor = AutoImageProcessor.from_pretrained(
-        "MiniMaxAI/MiniMax-M3", trust_remote_code=True
-    )
+    module = load_minimax_m31_reference()
+    img_processor = module.MiniMaxM3VLImageProcessor()
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
-    # Stage the provider contract's short-side floor (see above) before the
-    # hub processor's own smart resize.
-    max_pixels = getattr(img_processor, "max_pixels", None) or 576 * 28 * 28
-    image = minimax_m3_raise_to_short_side_floor(image, max_pixels)
-
     # Process image
-    outputs = img_processor(images=image, return_tensors="np")
+    outputs = img_processor(images=[image], return_tensors="pt")
     pixel_values = np.asarray(outputs["pixel_values"])
     image_grid_thw = outputs.get("image_grid_thw")
     if image_grid_thw is not None:
@@ -408,10 +397,15 @@ def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
     else:
         num_tokens = None
 
+    processor_config = img_processor.to_dict()
+    # Pin the resize rule the golden was generated with; the Rust processor
+    # defaults to it, and the explicit key keeps the fixture self-describing.
+    processor_config["resize_policy"] = "aligned_long_side"
+
     result = {
         "pixel_values": pixel_values,
         "original_size": original_size,
-        "processor_config": img_processor.to_dict(),
+        "processor_config": processor_config,
     }
 
     if image_grid_thw is not None:
@@ -425,8 +419,11 @@ def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
         "patch_size": patch_size,
         "merge_size": merge_size,
         "temporal_patch_size": temporal_patch_size,
-        "min_pixels": getattr(img_processor, "min_pixels", None),
-        "max_pixels": getattr(img_processor, "max_pixels", None),
+        "resize_policy": "aligned_long_side",
+        "detail": getattr(img_processor, "detail", "auto"),
+        "max_long_side_pixel": getattr(img_processor, "max_long_side_pixel", None),
+        "reference": MINIMAX_M31_REFERENCE_URL,
+        "reference_sha256": MINIMAX_M31_REFERENCE_SHA256,
     }
 
     return result

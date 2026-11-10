@@ -37,6 +37,7 @@ use crate::{
         processor::{
             ModelSpecificValue, PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
         },
+        processors::resize_policy::QwenResizePolicy,
         rgb_runs,
         transforms::{
             par_threads, pil_to_filter, resize, resize_bicubic_torch_aa,
@@ -63,6 +64,11 @@ pub struct QwenVLConfig {
     pub video_max_pixels: usize,
     /// Whether the video budget applies per frame or to the sampled volume.
     pub video_resize_mode: QwenVideoResizeMode,
+    /// How resize targets are picked: Qwen's area-bounded `smart_resize`
+    /// (the default) or MiniMax-M3.1's aligned long-side resize. Under
+    /// [`QwenResizePolicy::AlignedLongSide`] the `min_pixels`/`max_pixels`
+    /// bounds above are inert; the policy carries its own numbers.
+    pub resize_policy: QwenResizePolicy,
     /// Temporal patch size for video
     pub temporal_patch_size: usize,
     /// Normalization mean values
@@ -404,6 +410,21 @@ impl QwenVLProcessorBase {
         self
     }
 
+    /// This processor with a per-clip long-side cap for the aligned resize
+    /// policy's video path (a request's `max_long_side_pixel`); a no-op under
+    /// the smart resize policy.
+    pub(super) fn with_video_long_side_override(mut self, cap: Option<u32>) -> Self {
+        if let QwenResizePolicy::AlignedLongSide(policy) = &mut self.config.resize_policy {
+            policy.video_long_side_override = cap;
+        }
+        self
+    }
+
+    /// The resize policy this processor picks targets with.
+    pub fn resize_policy(&self) -> &QwenResizePolicy {
+        &self.config.resize_policy
+    }
+
     /// Whether frames are resized to the planned grid (`do_resize`).
     pub(super) fn resizes(&self) -> bool {
         self.transforms.do_resize
@@ -600,6 +621,11 @@ impl QwenVLProcessorBase {
     ) -> Result<(usize, usize), TransformError> {
         let factor = self.get_factor();
 
+        if let QwenResizePolicy::AlignedLongSide(policy) = &self.config.resize_policy {
+            let cap = policy.image_long_side();
+            return policy.aligned_size(height, width, factor, cap);
+        }
+
         // Validate non-zero dimensions
         if height == 0 || width == 0 {
             return Err(TransformError::InvalidShape {
@@ -673,6 +699,12 @@ impl QwenVLProcessorBase {
         width: usize,
     ) -> Result<(usize, usize), TransformError> {
         let factor = self.get_factor();
+
+        if let QwenResizePolicy::AlignedLongSide(policy) = &self.config.resize_policy {
+            // The aligned floors upscale sub-factor frames, so the
+            // below-factor guard of the Qwen rule does not apply.
+            return policy.aligned_video_size(num_frames, height, width, factor);
+        }
 
         if num_frames == 0 {
             return Err(TransformError::InvalidShape {
@@ -2012,6 +2044,7 @@ mod tests {
             video_min_pixels: 256 * 28 * 28,
             video_max_pixels: 1280 * 28 * 28,
             video_resize_mode: QwenVideoResizeMode::TotalVolume,
+            resize_policy: QwenResizePolicy::SmartResize,
             temporal_patch_size: 2,
             mean: [0.5, 0.5, 0.5],
             std: [0.5, 0.5, 0.5],
@@ -2042,6 +2075,7 @@ mod tests {
             video_min_pixels: as_usize(&family["min_pixels"]),
             video_max_pixels: as_usize(&family["max_pixels"]),
             video_resize_mode: QwenVideoResizeMode::PerFrame,
+            resize_policy: QwenResizePolicy::SmartResize,
             temporal_patch_size: 2,
             mean: [0.5; 3],
             std: [0.5; 3],
@@ -2069,6 +2103,7 @@ mod tests {
             video_min_pixels: 1,
             video_max_pixels: 1024 * 1024,
             video_resize_mode: QwenVideoResizeMode::TotalVolume,
+            resize_policy: QwenResizePolicy::SmartResize,
             temporal_patch_size: 2,
             mean: [0.5, 0.25, 0.75],
             std: [0.5, 0.25, 0.5],
@@ -2460,6 +2495,7 @@ mod tests {
             video_min_pixels: 1,
             video_max_pixels: 16_777_216,
             video_resize_mode: QwenVideoResizeMode::TotalVolume,
+            resize_policy: QwenResizePolicy::SmartResize,
             temporal_patch_size: 2,
             mean: [0.5; 3],
             std: [0.5; 3],

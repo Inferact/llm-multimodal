@@ -43,6 +43,7 @@ pub mod qwen2_vl;
 pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
+pub mod resize_policy;
 
 pub use deepseek_v41::DeepseekV41Processor;
 pub use gemma4::Gemma4Processor;
