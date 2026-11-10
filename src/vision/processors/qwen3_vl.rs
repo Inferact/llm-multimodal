@@ -20,7 +20,10 @@ use std::ops::Deref;
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
+use super::{
+    qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
+    resize_policy::QwenResizePolicy,
+};
 use crate::{
     encoder_inputs::EncoderDtype,
     types::{Modality, RgbFrameRef},
@@ -120,6 +123,7 @@ impl Qwen3VLProcessor {
                 video_min_pixels,
                 video_max_pixels,
                 video_resize_mode: QwenVideoResizeMode::TotalVolume,
+                resize_policy: QwenResizePolicy::SmartResize,
                 temporal_patch_size,
                 mean: QWEN3_MEAN,
                 std: QWEN3_STD,

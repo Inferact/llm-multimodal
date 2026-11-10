@@ -2,13 +2,34 @@
 //!
 //! Despite the `image_grid_pinpoints` and `process_image_mode: "dynamic_res"`
 //! keys in its config — which read as LLaVA-NeXT tiling — MiniMax-M3 preprocesses
-//! images the Qwen2-VL way: a Qwen-style `smart_resize` onto a
-//! `patch_size * merge_size` grid, patchified into a flat
+//! images the Qwen2-VL way: a resize onto a `patch_size * merge_size` grid,
+//! patchified into a flat
 //! `[total_patches, channels * temporal_patch_size * patch_size^2]` tensor
 //! alongside an `image_grid_thw` triple. The engine's M3 vision tower consumes exactly
-//! that layout, so this processor wraps the shared [`QwenVLProcessorBase`],
-//! supplies M3's own parameters, and raises images below M3's short-side floor
-//! before delegating.
+//! that layout, so this processor wraps the shared [`QwenVLProcessorBase`]
+//! and supplies M3's own parameters.
+//!
+//! # Resize policy
+//!
+//! The resize rule is configurable; see [`QwenResizePolicy`]. The default is
+//! the MiniMax-M3.1 **aligned long-side resize**
+//! ([`QwenResizePolicy::AlignedLongSide`]): inputs are floored to an area of
+//! 168² and a short side of 168, both sides round UP to the 28 px factor, and
+//! each side is capped at a per-modality long side — for images the
+//! OpenAI-style `detail` tier (low 672 / auto 2,016 / high 3,584, default
+//! auto; an explicit `max_long_side_pixel` wins, clamped to 3,584), for video
+//! frames the video tier (low 504 / auto 672 / high 2,188; a request's
+//! `max_long_side_pixel` wins). A clip whose resized
+//! `width * height * frames` exceeds 301,056,000 is rejected. There is no
+//! area cap.
+//!
+//! `"resize_policy": "smart_resize"` in the preprocessor config selects the
+//! previous behavior instead: Qwen2-VL's `smart_resize` with M3's bounds
+//! (min_pixels 3,136, max_pixels 451,584 = `image_seq_length` 576 tokens,
+//! video frames bounded at 602,112 px with `max_long_side_pixel` tiers),
+//! including the 112 px short-side raise. Every aligned number, and the
+//! policy itself, is overridable from the preprocessor config — see the
+//! [`resize_policy`](super::resize_policy) module docs for the keys.
 //!
 //! # MiniMax-M3 parameters
 //!
@@ -16,21 +37,10 @@
 //! - merge_size: 2 (`img_token_compression_config.spatial_merge_size`)
 //! - temporal_patch_size: 2 (`img_token_compression_config.temporal_patch_size`)
 //! - factor: 28 (patch_size * merge_size)
-//! - min_pixels: 3,136 (4 * 28 * 28)
-//! - max_pixels: 451,584 (576 * 28 * 28) — matches `image_seq_length: 576`
-//! - video max_pixels: 602,112 (768 * 28 * 28), bounding each frame rather than
-//!   the sampled volume, as the reference video processor applies `smart_resize`
-//!   to the frame size. A request that names a `max_long_side_pixel` tier has
-//!   its frames capped to that long side upstream, and the tier's square becomes
-//!   the frame budget instead: shrinking those frames again to the default would
-//!   make the 1008 and 2016 tiers produce the same tokens for 16:9 sources.
-//! - min short side: 112 px (images below it are raised first; video frames are not);
-//!   past roughly 36:1 the raised image overshoots max_pixels, so the grid is its uniform
-//!   scale-down and the short side ends below 112 again
 //! - normalization: CLIP mean/std
 //!
-//! The bounds differ from Qwen2-VL's (200,704 / 1,003,520), so M3 cannot simply
-//! reuse the Qwen2-VL processor's defaults.
+//! The smart-resize bounds differ from Qwen2-VL's (200,704 / 1,003,520), so
+//! M3 cannot simply reuse the Qwen2-VL processor's defaults.
 
 use std::{borrow::Cow, ops::Deref};
 
@@ -39,6 +49,7 @@ use image::{imageops::FilterType, DynamicImage};
 use super::{
     qwen2_vl::{CLIP_MEAN, CLIP_STD},
     qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
+    resize_policy::{self, QwenResizePolicy},
 };
 use crate::{
     types::RgbFrameRef,
@@ -58,20 +69,24 @@ pub const DEFAULT_MERGE_SIZE: usize = 2;
 /// Default temporal patch size (video frames are padded to a multiple of this).
 pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
-/// Default minimum pixels (4 * 28 * 28 = 3,136).
+/// Default minimum pixels (4 * 28 * 28 = 3,136), sizing the smart resize
+/// policy; the aligned policy floors the area at 168² instead.
 pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
 
-/// Default maximum pixels for images (576 * 28 * 28 = 451,584).
+/// Default maximum pixels for images (576 * 28 * 28 = 451,584), the smart
+/// resize policy's area cap.
 ///
 /// 576 is the model's `image_seq_length`: at the bound, an image occupies
 /// exactly `image_seq_length` tokens after the 2x2 merge (2,304 patches before
 /// it).
 pub const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
 
-/// Default maximum pixels per video frame (768 * 28 * 28 = 602,112), not per sampled volume.
+/// Default maximum pixels per video frame (768 * 28 * 28 = 602,112) under the
+/// smart resize policy, not per sampled volume.
 pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
 
-/// Short side floor in pixels, four patch factors; smaller images are scaled up to it first.
+/// Short side floor in pixels of the smart resize policy's staging raise,
+/// four patch factors; smaller images are scaled up to it first.
 const MIN_SHORT_SIDE: u32 = 112;
 
 /// The base's aspect-ratio guard (`smart_resize` in qwen_vl_base.rs), which a staged image must
@@ -100,7 +115,8 @@ impl Default for MiniMaxM3VisionProcessor {
 }
 
 impl MiniMaxM3VisionProcessor {
-    /// Create a processor with MiniMax-M3's default parameters.
+    /// Create a processor with MiniMax-M3's default parameters and the M3.1
+    /// aligned long-side resize policy.
     pub fn new() -> Self {
         Self::build(
             DEFAULT_PATCH_SIZE,
@@ -109,10 +125,15 @@ impl MiniMaxM3VisionProcessor {
             DEFAULT_MIN_PIXELS,
             DEFAULT_MAX_PIXELS,
             DEFAULT_VIDEO_MAX_PIXELS,
+            QwenResizePolicy::AlignedLongSide(resize_policy::minimax_m31_aligned()),
         )
     }
 
-    /// Create a processor with custom settings.
+    /// Create a processor with custom smart-resize settings.
+    ///
+    /// The bounds this constructor takes are the smart resize rule's, so it
+    /// selects [`QwenResizePolicy::SmartResize`]; a preprocessor config can
+    /// still switch the policy per request layering.
     pub fn with_config(
         patch_size: usize,
         merge_size: usize,
@@ -129,6 +150,7 @@ impl MiniMaxM3VisionProcessor {
             min_pixels,
             max_pixels,
             max_pixels,
+            QwenResizePolicy::SmartResize,
         )
     }
 
@@ -139,6 +161,7 @@ impl MiniMaxM3VisionProcessor {
         min_pixels: usize,
         max_pixels: usize,
         video_max_pixels: usize,
+        resize_policy: QwenResizePolicy,
     ) -> Self {
         Self {
             inner: QwenVLProcessorBase::new(QwenVLConfig {
@@ -149,6 +172,7 @@ impl MiniMaxM3VisionProcessor {
                 video_min_pixels: min_pixels,
                 video_max_pixels,
                 video_resize_mode: QwenVideoResizeMode::PerFrame,
+                resize_policy,
                 temporal_patch_size,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -231,6 +255,19 @@ impl MiniMaxM3VisionProcessor {
             .unwrap_or_else(|| self.inner.merge_size());
         let temporal_patch_size = Self::declared_temporal_patch_size(config)?
             .unwrap_or_else(|| self.inner.temporal_patch_size());
+        let patch_size = config.get_patch_size(self.inner.patch_size());
+        let factor = patch_size * merge_size;
+
+        // The resize policy the config selects, layered over this processor's
+        // aligned settings when it already runs the aligned policy (or over
+        // the M3.1 defaults when it does not).
+        let aligned_base = match self.inner.resize_policy() {
+            QwenResizePolicy::AlignedLongSide(aligned) => aligned.clone(),
+            QwenResizePolicy::SmartResize => resize_policy::minimax_m31_aligned(),
+        };
+        let policy = QwenResizePolicy::from_config(config, &aligned_base, factor)?
+            .unwrap_or_else(|| self.inner.resize_policy().clone());
+
         let max_pixels = config.max_pixels.unwrap_or_else(|| self.inner.max_pixels());
         let min_pixels = config.min_pixels.unwrap_or_else(|| self.inner.min_pixels());
         // Track an explicit `max_pixels` in both directions: flooring the video
@@ -241,36 +278,54 @@ impl MiniMaxM3VisionProcessor {
             .unwrap_or_else(|| self.inner.video_max_pixels());
 
         let mut layered = Self::build(
-            config.get_patch_size(self.inner.patch_size()),
+            patch_size,
             merge_size,
             temporal_patch_size,
             min_pixels,
             max_pixels,
             video_max_pixels,
+            policy,
         );
         layered.inner = layered.inner.with_preprocessor_config(config);
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
         Ok(layered)
     }
 
-    /// This processor for one clip: a `max_long_side_pixel` tier on the
-    /// request is the caller's frame budget (see the module docs), unless
-    /// `max_pixels` was set explicitly. The budget is the square of the long
-    /// side, so a frame already capped to that side is never shrunk again.
+    /// This processor for one clip.
+    ///
+    /// Under the smart resize policy a `max_long_side_pixel` tier on the
+    /// request is the caller's frame budget, unless `max_pixels` was set
+    /// explicitly; the budget is the square of the long side, so a frame
+    /// already capped to that side is never shrunk again. Under the aligned
+    /// policy the tier is the frame long-side cap itself, winning over the
+    /// config's detail tier and explicit cap.
     fn for_clip(&self, clip: &VideoClipOptions) -> Cow<'_, Self> {
-        match clip.max_long_side_pixel {
-            Some(tier) if !self.explicit_max_pixels => {
-                let tier = tier as usize;
-                let budget = tier.saturating_mul(tier).max(self.inner.min_pixels());
-                let mut processor = self.clone();
-                processor.inner = processor.inner.with_video_max_pixels(budget);
-                Cow::Owned(processor)
-            }
-            _ => Cow::Borrowed(self),
+        match self.inner.resize_policy() {
+            QwenResizePolicy::AlignedLongSide(_) => match clip.max_long_side_pixel {
+                Some(tier) => {
+                    let mut processor = self.clone();
+                    processor.inner = processor.inner.with_video_long_side_override(Some(tier));
+                    Cow::Owned(processor)
+                }
+                None => Cow::Borrowed(self),
+            },
+            QwenResizePolicy::SmartResize => match clip.max_long_side_pixel {
+                Some(tier) if !self.explicit_max_pixels => {
+                    let tier = tier as usize;
+                    let budget = tier.saturating_mul(tier).max(self.inner.min_pixels());
+                    let mut processor = self.clone();
+                    processor.inner = processor.inner.with_video_max_pixels(budget);
+                    Cow::Owned(processor)
+                }
+                _ => Cow::Borrowed(self),
+            },
         }
     }
 
     /// Dimensions with the short side raised to [`MIN_SHORT_SIDE`]; `None` if at it or zero.
+    ///
+    /// Part of the smart resize policy's staging; the aligned policy's floors
+    /// replace it.
     fn raised_dimensions(width: u32, height: u32) -> Option<(u32, u32)> {
         let short = width.min(height);
         if short == 0 || short >= MIN_SHORT_SIDE {
@@ -336,7 +391,9 @@ impl MiniMaxM3VisionProcessor {
 
     /// Stage every image below the floor, or `None` when none needs it so the batch stays borrowed.
     ///
-    /// Otherwise the whole batch is copied, not just the staged images, so the base gets one slice.
+    /// Smart resize policy only; the aligned policy's floors make the raise
+    /// redundant. Otherwise the whole batch is copied, not just the staged
+    /// images, so the base gets one slice.
     fn raise_images(
         &self,
         images: &[DynamicImage],
@@ -402,6 +459,13 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         &self,
         images: &[DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        // The aligned policy's floors replace the 112 px staging raise.
+        if matches!(
+            self.inner.resize_policy(),
+            QwenResizePolicy::AlignedLongSide(_)
+        ) {
+            return self.inner.preprocess(images);
+        }
         let Some(raised) = self.raise_images(images)? else {
             return self.inner.preprocess(images);
         };
@@ -431,6 +495,13 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        // The aligned policy has no staging; the base's target is the count's.
+        if matches!(
+            self.inner.resize_policy(),
+            QwenResizePolicy::AlignedLongSide(_)
+        ) {
+            return self.inner.calculate_num_tokens(width, height);
+        }
         // Staged the way `preprocess` stages the image.
         let staged = if self.inner.resizes() {
             self.staging_dimensions(width, height)?
@@ -478,6 +549,29 @@ mod tests {
         .expect("checkpoint preprocessor config parses")
     }
 
+    /// `m3_config` with the smart resize policy selected: the sizing behavior
+    /// before the aligned long-side resize became the default.
+    fn smart_config() -> PreProcessorConfig {
+        let mut config = m3_config();
+        config.extra.insert(
+            "resize_policy".to_string(),
+            serde_json::json!("smart_resize"),
+        );
+        config
+    }
+
+    fn smart_processor() -> MiniMaxM3VisionProcessor {
+        MiniMaxM3VisionProcessor::from_preprocessor_config(&smart_config())
+            .expect("smart-resize config is valid")
+    }
+
+    /// The checkpoint config with the aligned policy tuned by `policy`.
+    fn aligned_config(policy: serde_json::Value) -> PreProcessorConfig {
+        let mut config = m3_config();
+        config.extra.insert("resize_policy".to_string(), policy);
+        config
+    }
+
     #[test]
     fn defaults_match_the_checkpoint() {
         let processor = MiniMaxM3VisionProcessor::new();
@@ -487,6 +581,11 @@ mod tests {
         assert_eq!(processor.min_pixels(), 3136);
         assert_eq!(processor.max_pixels(), 451_584);
         assert_eq!(processor.model_name(), "minimax_m3");
+        // The M3.1 aligned long-side resize is the default policy.
+        assert!(matches!(
+            processor.resize_policy(),
+            QwenResizePolicy::AlignedLongSide(_)
+        ));
     }
 
     #[test]
@@ -558,8 +657,8 @@ mod tests {
 
     #[test]
     fn lowering_max_pixels_also_lowers_the_video_budget() {
-        let processor = MiniMaxM3VisionProcessor::new();
-        let mut config = m3_config();
+        let processor = smart_processor();
+        let mut config = smart_config();
         config.max_pixels = Some(100_352);
 
         let layered = processor.layered_over(&config).unwrap();
@@ -570,7 +669,7 @@ mod tests {
 
     #[test]
     fn a_video_tier_sets_the_frame_budget() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         let clip = VideoClipOptions {
             sample_fps: 2.0,
             max_long_side_pixel: Some(2016),
@@ -582,7 +681,7 @@ mod tests {
         assert_eq!(layered.max_pixels(), DEFAULT_MAX_PIXELS);
 
         // An explicit max_pixels still wins over the tier.
-        let mut config = m3_config();
+        let mut config = smart_config();
         config.max_pixels = Some(100_352);
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let layered = processor.for_clip(&clip);
@@ -591,7 +690,7 @@ mod tests {
 
     #[test]
     fn a_tier_budget_never_drops_below_the_frame_minimum() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         let clip = VideoClipOptions {
             sample_fps: 2.0,
             max_long_side_pixel: Some(28),
@@ -605,7 +704,7 @@ mod tests {
     fn video_tiers_change_the_token_count() {
         use crate::vision::processor::VisionPreProcessor;
 
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         let tokens = |width: u32, height: u32, tier: Option<u32>| {
             let clip = VideoClipOptions {
                 sample_fps: 2.0,
@@ -841,7 +940,7 @@ mod tests {
 
     #[test]
     fn short_sides_below_the_floor_are_raised_before_the_patch_grid() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         // 400x40 is raised to 1120x112: an 8x80 patch grid, 160 tokens after the 2x2 merge.
         assert_eq!(processor.calculate_num_tokens(400, 40).unwrap(), 160);
         assert_eq!(processor.calculate_num_tokens(40, 400).unwrap(), 160);
@@ -876,7 +975,7 @@ mod tests {
         // At a fixed long side, shrinking the short side below the floor raises
         // it by a larger factor, so the token count must not decrease while the
         // raised image still fits max_pixels (the verifier's 10_16 band).
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         let tokens: Vec<usize> = [90, 40, 20]
             .into_iter()
             .map(|short| processor.calculate_num_tokens(400, short).unwrap())
@@ -889,7 +988,7 @@ mod tests {
         // Beyond roughly 36:1 the raised image overshoots max_pixels, so the
         // base scales it down uniformly and the short side ends below 112
         // again, as the reference processor does; monotonicity is not kept.
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         let tokens: Vec<usize> = [20, 10, 5]
             .into_iter()
             .map(|short| processor.calculate_num_tokens(400, short).unwrap())
@@ -909,9 +1008,9 @@ mod tests {
         // pixels the base would get from a nearest-neighbour raise, and they
         // must differ from the bicubic ones.
         let image = gradient(400, 40);
-        let mut nearest = m3_config();
+        let mut nearest = smart_config();
         nearest.resampling = Some(0);
-        let mut bicubic = m3_config();
+        let mut bicubic = smart_config();
         bicubic.resampling = Some(3);
         let nearest = MiniMaxM3VisionProcessor::from_preprocessor_config(&nearest).unwrap();
         let bicubic = MiniMaxM3VisionProcessor::from_preprocessor_config(&bicubic).unwrap();
@@ -929,7 +1028,7 @@ mod tests {
     fn do_resize_false_skips_the_raise() {
         // The caller asked for no resizing, so the floor does not apply and
         // the base rejects the off-grid buffer exactly as it did before.
-        let mut config = m3_config();
+        let mut config = smart_config();
         config.do_resize = Some(false);
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         assert!(processor
@@ -940,7 +1039,7 @@ mod tests {
 
     #[test]
     fn staged_images_stay_near_the_pixel_budget() {
-        let processor = MiniMaxM3VisionProcessor::new();
+        let processor = smart_processor();
         let cap = (processor.max_pixels() as f64 * 1.3) as usize;
         for (width, height) in [
             (200, 1),
@@ -977,7 +1076,7 @@ mod tests {
 
     #[test]
     fn preprocess_resizes_a_flat_image_onto_the_raised_grid() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         let out = processor
             .preprocess(&[DynamicImage::new_rgb8(400, 40)])
             .expect("flat image preprocesses");
@@ -995,7 +1094,7 @@ mod tests {
         // The placeholder count and the produced grid come from different
         // entry points; they must agree, including where the raised long side
         // rounds to the patch factor (112x20 -> 627x112 -> 616x112).
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         for (width, height) in [(400, 40), (40, 400), (112, 20), (50, 50), (300, 80)] {
             let out = processor
                 .preprocess(&[DynamicImage::new_rgb8(width, height)])
@@ -1043,8 +1142,7 @@ mod tests {
 
     #[test]
     fn a_mixed_batch_with_an_off_contract_image_is_rejected_as_a_whole() {
-        // The oversized image is at the floor and never raised; it must still
-        // be vetted before the batch is copied.
+        // One off-contract image rejects the batch before any pixel work.
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
         let images = [
             DynamicImage::new_rgb8(112, 30_000),
@@ -1061,7 +1159,7 @@ mod tests {
     fn verifier_rule_b_cases_get_their_raised_grids() {
         // m3_image_tests 10_15: the five (width, height) cases and the token
         // count each produces once the short side is raised to 112.
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         let tokens: Vec<usize> = [(400, 40), (300, 80), (112, 20), (40, 400), (80, 300)]
             .into_iter()
             .map(|(width, height)| processor.calculate_num_tokens(width, height).unwrap())
@@ -1071,7 +1169,7 @@ mod tests {
 
     #[test]
     fn token_count_matches_preprocess_under_pixel_overrides() {
-        let mut config = m3_config();
+        let mut config = smart_config();
         config.max_pixels = Some(100_352);
         config.min_pixels = Some(50_176);
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
@@ -1092,8 +1190,8 @@ mod tests {
         // With max_pixels = 100,352 the base's target for 400x3 is 3640x28,
         // over the budget, so the base would scale it again; the shrunk raise
         // is staged instead and the grid is pinned.
-        let processor = MiniMaxM3VisionProcessor::new();
-        let mut config = m3_config();
+        let processor = smart_processor();
+        let mut config = smart_config();
         config.max_pixels = Some(100_352);
         let layered = processor.layered_over(&config).unwrap();
         assert_eq!(
@@ -1107,7 +1205,7 @@ mod tests {
     fn thin_band_grids_are_pinned() {
         // Past 144:1 the raise is shrunk before staging; the grids are within
         // a percent of the full raise's (293 and 339 tokens).
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         assert_eq!(processor.calculate_num_tokens(150, 1).unwrap(), 292);
         assert_eq!(processor.calculate_num_tokens(200, 1).unwrap(), 336);
     }
@@ -1121,7 +1219,9 @@ mod tests {
             DynamicImage::new_rgb8(224, 224),
         ];
         let out = processor.preprocess(&images).unwrap();
-        assert_eq!(out.feature_token_counts, vec![64, 160, 64]);
+        // The aligned policy leaves 224x224 at 64 tokens and floors 400x40
+        // up to 1680x168 (360 tokens).
+        assert_eq!(out.feature_token_counts, vec![64, 360, 64]);
     }
 
     #[test]
@@ -1137,7 +1237,8 @@ mod tests {
 
     #[test]
     fn video_frames_follow_the_base_unchanged() {
-        // The floor is an image rule here; clips take the base's own path.
+        // Clips take the base's own path; under the aligned policy 400x40
+        // frames floor up and cap to 672x84 (6x48 merged cells a pair).
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
         let frames = vec![DynamicImage::new_rgb8(400, 40); 2];
         let out = processor
@@ -1148,7 +1249,7 @@ mod tests {
             .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
             .unwrap();
         assert_eq!(out.feature_token_counts, base.feature_token_counts);
-        assert_eq!(out.feature_token_counts, vec![14]);
+        assert_eq!(out.feature_token_counts, vec![72]);
     }
 
     fn video_grid_thw(out: &PreprocessedEncoderInputs) -> Vec<i64> {
@@ -1163,7 +1264,7 @@ mod tests {
     #[test]
     fn the_video_budget_bounds_each_frame_not_the_sampled_volume() {
         // 720p lands on 560x1008 (720 tokens per pair) at any frame count; a volume budget gives 392x728 (364) for two frames.
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
         assert_eq!(processor.video_resize_mode(), QwenVideoResizeMode::PerFrame);
         assert_eq!(processor.video_max_pixels(), 602_112);
         assert_eq!(
@@ -1195,7 +1296,7 @@ mod tests {
 
     #[test]
     fn large_images_are_bounded_by_max_pixels() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let processor = smart_processor();
 
         // Well past the bound: the count must clamp to image_seq_length.
         let tokens = processor.calculate_num_tokens(4096, 4096).unwrap();
@@ -1211,8 +1312,219 @@ mod tests {
         // before the pixel-budget test, so a 1x100 image keeps its rounded long
         // side (28x112 = exactly min_pixels, no scale-up); the Qwen rule would
         // scale it up to 28x560.
-        let processor = MiniMaxM3VisionProcessor::new();
+        let processor = smart_processor();
         assert_eq!(processor.inner.smart_resize(1, 100).unwrap(), (28, 112));
         assert_eq!(processor.inner.smart_resize(100, 1).unwrap(), (112, 28));
+    }
+
+    // ====================================================================
+    // Aligned long-side resize (the default policy)
+    // ====================================================================
+
+    /// The resized size `(width, height)` the aligned policy picks for an
+    /// image, through the base's entry point.
+    fn aligned_image_size(
+        processor: &MiniMaxM3VisionProcessor,
+        width: u32,
+        height: u32,
+    ) -> (u32, u32) {
+        let (h, w) = processor
+            .inner
+            .smart_resize(height as usize, width as usize)
+            .unwrap();
+        (w as u32, h as u32)
+    }
+
+    #[test]
+    fn aligned_resize_matches_the_m31_size_spec_examples() {
+        // The MiniMax-M3.1 sizing spec's worked examples (image, detail auto):
+        // width x height -> resized width x height = merged tokens.
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        for (width, height, want_w, want_h, tokens) in [
+            (2016, 1134, 2016, 1148, 2952),
+            (1920, 1080, 1932, 1092, 2691),
+            (1024, 768, 1036, 784, 1036),
+            (4000, 3000, 2016, 1540, 3960),
+            (1000, 100, 1680, 168, 360),
+        ] {
+            assert_eq!(
+                aligned_image_size(&processor, width, height),
+                (want_w, want_h),
+                "{width}x{height}"
+            );
+            assert_eq!(
+                processor.calculate_num_tokens(width, height).unwrap(),
+                tokens,
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn aligned_resize_detail_tiers_set_the_image_long_side_cap() {
+        // A 4:3 image past every tier's cap, resized under each: low 672,
+        // auto 2016 (the default), high 3584.
+        let tokens = |detail: &str| {
+            let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&aligned_config(
+                serde_json::json!({"detail": detail}),
+            ))
+            .unwrap();
+            processor.calculate_num_tokens(4000, 3000).unwrap()
+        };
+        assert_eq!(tokens("low"), 456); // 672x532
+        assert_eq!(tokens("auto"), 3960); // 2016x1540
+        assert_eq!(tokens("high"), 12416); // 3584x2716
+    }
+
+    #[test]
+    fn aligned_resize_explicit_max_long_side_pixel_wins_and_clamps() {
+        // An explicit cap wins over the detail tier...
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&aligned_config(
+            serde_json::json!({"detail": "high", "max_long_side_pixel": 1008}),
+        ))
+        .unwrap();
+        assert_eq!(processor.calculate_num_tokens(4000, 3000).unwrap(), 1008); // 1008x784
+
+        // ...and is clamped to the high tier rather than rejected.
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&aligned_config(
+            serde_json::json!({"max_long_side_pixel": 999_999}),
+        ))
+        .unwrap();
+        assert_eq!(processor.calculate_num_tokens(4000, 3000).unwrap(), 12416); // 3584x2716
+
+        // A cap below the alignment factor is a configuration error.
+        assert!(
+            MiniMaxM3VisionProcessor::from_preprocessor_config(&aligned_config(
+                serde_json::json!({"max_long_side_pixel": 14}),
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn aligned_resize_rejects_extreme_ratios_and_zero_dimensions() {
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        // 200:1 exactly is still accepted.
+        assert!(processor.calculate_num_tokens(200, 1).is_ok());
+        assert!(processor.calculate_num_tokens(201, 1).is_err());
+        assert!(processor.calculate_num_tokens(1, 201).is_err());
+        assert!(processor.calculate_num_tokens(0, 100).is_err());
+        assert!(processor.calculate_num_tokens(100, 0).is_err());
+    }
+
+    #[test]
+    fn aligned_resize_floors_tiny_images() {
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        // Below the 168^2 area floor and the 168 short-side floor.
+        assert_eq!(aligned_image_size(&processor, 100, 100), (168, 168));
+        assert_eq!(aligned_image_size(&processor, 50, 50), (168, 168));
+        assert_eq!(processor.calculate_num_tokens(100, 100).unwrap(), 36);
+        // The floors upscale past the old smart-resize minimum.
+        assert_eq!(aligned_image_size(&processor, 400, 40), (1680, 168));
+    }
+
+    #[test]
+    fn aligned_resize_ignores_the_legacy_pixel_bound_keys() {
+        // min_pixels/max_pixels size the smart resize; under the aligned
+        // policy they are legacy keys the M3.1 reference accepts and ignores.
+        let mut config = m3_config();
+        config.max_pixels = Some(3_136);
+        config.min_pixels = Some(50_176);
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
+        // 448x448 would clamp under the smart rule with a 3,136 area cap;
+        // the aligned policy leaves it on its own grid.
+        assert_eq!(processor.calculate_num_tokens(448, 448).unwrap(), 256);
+    }
+
+    #[test]
+    fn aligned_resize_token_count_matches_preprocess() {
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        for (width, height) in [(400, 40), (100, 100), (4000, 3000), (112, 20), (2016, 1134)] {
+            let out = processor
+                .preprocess(&[DynamicImage::new_rgb8(width, height)])
+                .unwrap();
+            assert_eq!(
+                out.feature_token_counts,
+                vec![processor.calculate_num_tokens(width, height).unwrap()],
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn aligned_video_caps_frames_at_the_detail_tier() {
+        let grid_and_tokens = |detail: Option<&str>, clip_cap: Option<u32>| {
+            let config = match detail {
+                Some(detail) => aligned_config(serde_json::json!({"detail": detail})),
+                None => m3_config(),
+            };
+            let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
+            let frames = vec![DynamicImage::new_rgb8(1280, 720); 2];
+            let clip = VideoClipOptions {
+                sample_fps: 2.0,
+                max_long_side_pixel: clip_cap,
+            };
+            let out = processor.preprocess_video(&frames, &clip).unwrap();
+            (video_grid_thw(&out), out.feature_token_counts[0])
+        };
+
+        assert_eq!(grid_and_tokens(None, None), (vec![1, 28, 48], 336)); // 672x392
+        assert_eq!(grid_and_tokens(Some("low"), None), (vec![1, 22, 36], 198)); // 504x308
+        assert_eq!(grid_and_tokens(Some("high"), None), (vec![1, 52, 92], 1196)); // 1288x728
+                                                                                  // A request's max_long_side_pixel wins over a non-auto detail.
+        assert_eq!(
+            grid_and_tokens(Some("high"), Some(1008)),
+            (vec![1, 42, 72], 756) // 1008x588
+        );
+    }
+
+    #[test]
+    fn aligned_video_floors_upscale_small_frames() {
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        // 100x20 frames floor to 169x832 (the reference's float rounding) and
+        // cap to the 672 long side: 672x168.
+        let frames = vec![DynamicImage::new_rgb8(100, 20); 2];
+        let out = processor
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
+            .unwrap();
+        assert_eq!(video_grid_thw(&out), vec![1, 12, 48]);
+        assert_eq!(out.feature_token_counts, vec![144]);
+    }
+
+    #[test]
+    fn aligned_video_rejects_clips_past_the_volume_cap() {
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        // 720p frames resize to 392x672; the cap admits 1,142 of them.
+        assert!(processor.smart_resize_video(1142, 720, 1280).is_ok());
+        assert!(processor.smart_resize_video(1143, 720, 1280).is_err());
+    }
+
+    #[test]
+    fn smart_resize_policy_reproduces_the_previous_sizing() {
+        // The pre-aligned behavior stays selectable from the config.
+        let processor = smart_processor();
+        assert!(matches!(
+            processor.resize_policy(),
+            QwenResizePolicy::SmartResize
+        ));
+        assert_eq!(processor.calculate_num_tokens(448, 448).unwrap(), 256);
+        assert!(processor.calculate_num_tokens(4096, 4096).unwrap() <= 576);
+        // The 112 px short-side raise is part of the smart policy.
+        assert_eq!(processor.calculate_num_tokens(400, 40).unwrap(), 160);
+    }
+
+    #[test]
+    fn malformed_resize_policy_is_rejected_at_construction() {
+        for bad in [
+            serde_json::json!("aligned-long-side"),
+            serde_json::json!({"kind": "aligned_long_side", "detail": "medium"}),
+            serde_json::json!({"kind": "aligned_long_side", "surprise": 1}),
+        ] {
+            let config = aligned_config(bad.clone());
+            assert!(
+                MiniMaxM3VisionProcessor::from_preprocessor_config(&config).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

@@ -8,7 +8,10 @@
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
+use super::{
+    qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
+    resize_policy::QwenResizePolicy,
+};
 use crate::{
     encoder_inputs::EncoderDtype,
     types::{Modality, RgbFrameRef},
@@ -71,6 +74,7 @@ impl Qwen3OmniVisionProcessor {
                 video_min_pixels,
                 video_max_pixels,
                 video_resize_mode: QwenVideoResizeMode::PerFrame,
+                resize_policy: QwenResizePolicy::SmartResize,
                 temporal_patch_size,
                 mean: QWEN3_OMNI_MEAN,
                 std: QWEN3_OMNI_STD,
