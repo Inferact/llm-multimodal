@@ -163,15 +163,22 @@ impl FetchOutcome {
 
 /// One fetch, as the tracker reports it when the fetch ends: the modality,
 /// where the bytes came from, how it ended, how long the fetch and decode
-/// took, the attempts the fetch took, and the bytes it brought in (none
-/// when it failed). A part that repeats another part of the same request is
-/// not a fetch and is not reported.
+/// took and how long obtaining the bytes alone took, the attempts the
+/// fetch took, and the bytes it brought in (none when it failed). A part
+/// that repeats another part of the same request is not a fetch and is not
+/// reported.
 #[derive(Clone, Copy, Debug)]
 pub struct FetchReport {
     pub modality: Modality,
     pub source: FetchSourceKind,
     pub outcome: FetchOutcome,
+    /// The fetch and the decode together.
     pub duration: std::time::Duration,
+    /// The time obtaining the item's bytes took, excluding the media
+    /// decode: the network fetch with its retries, the image-byte cache
+    /// read, or the data URL's base64 decode; zero for inline bytes, which
+    /// are already in hand.
+    pub download: std::time::Duration,
     /// The attempts the fetch took: 1 plus the retries its transient
     /// failures used (see `MediaConnectorConfig::fetch_retries`); 0 on a
     /// cache hit, when nothing is fetched.
@@ -456,9 +463,9 @@ impl AsyncMultiModalTracker {
             format!("{cfg:?}"),
             source,
             move |connector, source| async move {
-                let (attempts, clip) = connector.fetch_video_from(&source, cfg).await;
+                let (stats, clip) = connector.fetch_video_from(&source, cfg).await;
                 (
-                    FetchStats::without_cache(attempts),
+                    stats,
                     clip.map(TrackedMedia::Video).map_err(MultiModalError::from),
                 )
             },
@@ -473,9 +480,9 @@ impl AsyncMultiModalTracker {
             String::new(),
             source,
             |connector, source| async move {
-                let (attempts, clip) = connector.fetch_audio_from(&source).await;
+                let (stats, clip) = connector.fetch_audio_from(&source).await;
                 (
-                    FetchStats::without_cache(attempts),
+                    stats,
                     clip.map(TrackedMedia::Audio).map_err(MultiModalError::from),
                 )
             },
@@ -526,6 +533,7 @@ impl AsyncMultiModalTracker {
                                     source: kind,
                                     outcome: FetchOutcome::of(&result),
                                     duration: started.elapsed(),
+                                    download: stats.download,
                                     attempts: stats.attempts,
                                     cache: stats.cache,
                                     bytes: result.as_ref().map_or(0, fetched_bytes),
@@ -831,6 +839,10 @@ mod repeat_tests {
         assert_eq!(fetched.1.modality, Modality::Image);
         assert_eq!(fetched.1.source, FetchSourceKind::DataUrl);
         assert!(fetched.1.bytes > 0, "{:?}", fetched.1);
+        // The download is the base64 decode of the data URL, a part of the
+        // fetch's whole duration.
+        assert!(fetched.1.download > std::time::Duration::ZERO, "{:?}", fetched.1);
+        assert!(fetched.1.download <= fetched.1.duration, "{:?}", fetched.1);
         let failed = reports
             .iter()
             .find(|(_, report)| report.outcome == FetchOutcome::ClientFault)
