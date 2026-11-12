@@ -389,11 +389,16 @@ impl FetchSource {
 
 /// How one fetch ran, as the tracker reports it: the attempts it took (1
 /// plus the retries its transient failures used; 0 for a cache hit, which
-/// fetches nothing) and how the image-byte cache figured in it.
+/// fetches nothing), how the image-byte cache figured in it, and the time
+/// obtaining the item's bytes took, excluding the media decode: the
+/// network fetch with its retries, the image-byte cache read, the data
+/// URL's base64 decode, or the file read; zero for inline bytes, which
+/// are already in hand.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FetchStats {
     pub(crate) attempts: u32,
     pub(crate) cache: CacheOutcome,
+    pub(crate) download: Duration,
 }
 
 impl FetchStats {
@@ -402,6 +407,7 @@ impl FetchStats {
         Self {
             attempts: 0,
             cache: CacheOutcome::Hit,
+            download: Duration::ZERO,
         }
     }
 
@@ -410,6 +416,7 @@ impl FetchStats {
         Self {
             attempts,
             cache: CacheOutcome::Miss,
+            download: Duration::ZERO,
         }
     }
 
@@ -418,7 +425,13 @@ impl FetchStats {
         Self {
             attempts,
             cache: CacheOutcome::NotUsed,
+            download: Duration::ZERO,
         }
+    }
+
+    /// With the time obtaining the item's bytes took (see [`FetchStats`]).
+    pub(crate) fn with_download(self, download: Duration) -> Self {
+        Self { download, ..self }
     }
 }
 
@@ -527,10 +540,21 @@ impl MediaConnector {
     ) -> (FetchStats, Result<Arc<ImageFrame>, MediaConnectorError>) {
         match source {
             FetchSource::Url(url) => self.fetch_http_image(url, cfg, scope).await,
-            FetchSource::DataUrl(data_url) => (
-                FetchStats::without_cache(1),
-                Self::fetch_data_url(data_url, cfg),
-            ),
+            FetchSource::DataUrl(data_url) => {
+                let started = Instant::now();
+                let bytes = Self::data_url_bytes(data_url, image_max_input_bytes(), "image");
+                let stats = FetchStats::without_cache(1).with_download(started.elapsed());
+                let frame = bytes.and_then(|bytes| {
+                    Self::decode_image(
+                        bytes,
+                        cfg.detail,
+                        cfg.max_long_side_pixel,
+                        cfg.transparency,
+                        ImageSource::DataUrl,
+                    )
+                });
+                (stats, frame)
+            }
             FetchSource::InlineBytes(bytes) => (
                 FetchStats::without_cache(1),
                 Self::decode_image(
@@ -541,10 +565,10 @@ impl MediaConnector {
                     ImageSource::InlineBytes,
                 ),
             ),
-            FetchSource::File(path) => (
-                FetchStats::without_cache(1),
-                self.fetch_file(path, cfg).await,
-            ),
+            FetchSource::File(path) => {
+                let (download, frame) = self.fetch_file(path, cfg).await;
+                (FetchStats::without_cache(1).with_download(download), frame)
+            }
         }
     }
 
@@ -556,21 +580,33 @@ impl MediaConnector {
         self.fetch_video_from(&source.into(), cfg).await.1
     }
 
-    /// The fetch, with the attempts it took (see [`Self::fetch_image_from`]).
+    /// The fetch, with how it ran (see [`Self::fetch_image_from`]).
     pub(crate) async fn fetch_video_from(
         &self,
         source: &FetchSource,
         cfg: VideoFetchConfig,
-    ) -> (u32, Result<Arc<VideoClip>, MediaConnectorError>) {
+    ) -> (FetchStats, Result<Arc<VideoClip>, MediaConnectorError>) {
         match source {
             FetchSource::Url(url) => self.fetch_http_video(url, cfg).await,
-            FetchSource::DataUrl(data_url) => (1, self.fetch_video_data_url(data_url, cfg).await),
+            FetchSource::DataUrl(data_url) => {
+                let started = Instant::now();
+                let bytes = Self::data_url_bytes(data_url, video_max_input_bytes(), "video");
+                let stats = FetchStats::without_cache(1).with_download(started.elapsed());
+                let clip = match bytes {
+                    Ok(bytes) => self.decode_video(bytes, cfg, VideoSource::DataUrl).await,
+                    Err(error) => Err(error),
+                };
+                (stats, clip)
+            }
             FetchSource::InlineBytes(bytes) => (
-                1,
+                FetchStats::without_cache(1),
                 self.decode_video(bytes.clone(), cfg, VideoSource::InlineBytes)
                     .await,
             ),
-            FetchSource::File(path) => (1, self.fetch_video_file(path, cfg).await),
+            FetchSource::File(path) => {
+                let (download, clip) = self.fetch_video_file(path, cfg).await;
+                (FetchStats::without_cache(1).with_download(download), clip)
+            }
         }
     }
 
@@ -581,20 +617,32 @@ impl MediaConnector {
         self.fetch_audio_from(&source.into()).await.1
     }
 
-    /// The fetch, with the attempts it took (see [`Self::fetch_image_from`]).
+    /// The fetch, with how it ran (see [`Self::fetch_image_from`]).
     pub(crate) async fn fetch_audio_from(
         &self,
         source: &FetchSource,
-    ) -> (u32, Result<Arc<AudioClip>, MediaConnectorError>) {
+    ) -> (FetchStats, Result<Arc<AudioClip>, MediaConnectorError>) {
         match source {
             FetchSource::Url(url) => self.fetch_http_audio(url).await,
-            FetchSource::DataUrl(data_url) => (1, self.fetch_audio_data_url(data_url).await),
+            FetchSource::DataUrl(data_url) => {
+                let started = Instant::now();
+                let bytes = Self::data_url_bytes(data_url, audio_max_input_bytes(), "audio");
+                let stats = FetchStats::without_cache(1).with_download(started.elapsed());
+                let clip = match bytes {
+                    Ok(bytes) => self.decode_audio(bytes, AudioSource::DataUrl).await,
+                    Err(error) => Err(error),
+                };
+                (stats, clip)
+            }
             FetchSource::InlineBytes(bytes) => (
-                1,
+                FetchStats::without_cache(1),
                 self.decode_audio(bytes.clone(), AudioSource::InlineBytes)
                     .await,
             ),
-            FetchSource::File(path) => (1, self.fetch_audio_file(path).await),
+            FetchSource::File(path) => {
+                let (download, clip) = self.fetch_audio_file(path).await;
+                (FetchStats::without_cache(1).with_download(download), clip)
+            }
         }
     }
 
@@ -633,6 +681,7 @@ impl MediaConnector {
             .as_ref()
             .and_then(|cache| Some((cache.clone(), cache.key(&parsed, scope)?)));
         let Some((cache, key)) = key else {
+            let started = Instant::now();
             let (attempts, bytes) = self
                 .fetch_http_bytes_retried(
                     &parsed,
@@ -641,14 +690,23 @@ impl MediaConnector {
                     "image",
                 )
                 .await;
-            return (FetchStats::without_cache(attempts), bytes.and_then(decode));
+            return (
+                FetchStats::without_cache(attempts).with_download(started.elapsed()),
+                bytes.and_then(decode),
+            );
         };
 
         // A hit decodes the cached bytes under the same rules as fetched
         // bytes: the byte cap applies again, and the frame's source stays
-        // the URL, so the frame and its hash are the fetch's.
+        // the URL, so the frame and its hash are the fetch's. The download
+        // time starts at the cache read: a miss obtains its bytes from the
+        // network fetch that follows it.
+        let started = Instant::now();
         if let Some(bytes) = cache.store.get(&key).await {
-            return (FetchStats::hit(), decode(bytes));
+            return (
+                FetchStats::hit().with_download(started.elapsed()),
+                decode(bytes),
+            );
         }
         let (attempts, bytes) = self
             .fetch_http_bytes_retried(
@@ -658,9 +716,10 @@ impl MediaConnector {
                 "image",
             )
             .await;
+        let stats = FetchStats::miss(attempts).with_download(started.elapsed());
         let bytes = match bytes {
             Ok(bytes) => bytes,
-            Err(error) => return (FetchStats::miss(attempts), Err(error)),
+            Err(error) => return (stats, Err(error)),
         };
         // Store without waiting for it: a cache that stalls or fails must
         // not hold the request; a failed write is a lost entry.
@@ -672,13 +731,15 @@ impl MediaConnector {
         tokio::spawn(async move {
             store.put(put_key, put_bytes).await;
         });
-        (FetchStats::miss(attempts), decode(bytes))
+        (stats, decode(bytes))
     }
 
-    fn fetch_data_url(
+    /// The bytes a base64 data URL carries, held to `limit`.
+    fn data_url_bytes(
         data_url: &str,
-        cfg: ImageFetchConfig,
-    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        limit: usize,
+        media: &'static str,
+    ) -> Result<Bytes, MediaConnectorError> {
         let (metadata, data) = data_url
             .split_once(',')
             .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
@@ -690,62 +751,17 @@ impl MediaConnector {
         }
 
         let data = data.trim();
-        let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
-        Self::decode_image(
-            decoded.into(),
-            cfg.detail,
-            cfg.max_long_side_pixel,
-            cfg.transparency,
-            ImageSource::DataUrl,
-        )
+        decode_base64_with_limit(data, limit, media).map(Bytes::from)
     }
 
-    async fn fetch_video_data_url(
-        &self,
-        data_url: &str,
-        cfg: VideoFetchConfig,
-    ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
-
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, video_max_input_bytes(), "video")?;
-        self.decode_video(decoded.into(), cfg, VideoSource::DataUrl)
-            .await
-    }
-
-    async fn fetch_audio_data_url(
-        &self,
-        data_url: &str,
-    ) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
-
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, audio_max_input_bytes(), "audio")?;
-        self.decode_audio(decoded.into(), AudioSource::DataUrl)
-            .await
-    }
-
-    async fn fetch_file(
+    /// The bytes of a host file under the allowed root, with the file's
+    /// canonical path for the decoded media's source.
+    async fn read_media_file(
         &self,
         path: &Path,
-        cfg: ImageFetchConfig,
-    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        limit: usize,
+        media: &'static str,
+    ) -> Result<(PathBuf, Bytes), MediaConnectorError> {
         let allowed_root = self
             .allowed_local_media_path
             .as_ref()
@@ -760,27 +776,47 @@ impl MediaConnector {
             ));
         }
 
-        let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
-        Self::decode_image(
-            bytes,
-            cfg.detail,
-            cfg.max_long_side_pixel,
-            cfg.transparency,
-            ImageSource::File { path: canonical },
-        )
+        let bytes = read_file_with_limit(&canonical, limit, media).await?;
+        Ok((canonical, bytes))
+    }
+
+    async fn fetch_file(
+        &self,
+        path: &Path,
+        cfg: ImageFetchConfig,
+    ) -> (Duration, Result<Arc<ImageFrame>, MediaConnectorError>) {
+        let started = Instant::now();
+        let file = self.read_media_file(path, image_max_input_bytes(), "image").await;
+        let download = started.elapsed();
+        let frame = file.and_then(|(canonical, bytes)| {
+            Self::decode_image(
+                bytes,
+                cfg.detail,
+                cfg.max_long_side_pixel,
+                cfg.transparency,
+                ImageSource::File { path: canonical },
+            )
+        });
+        (download, frame)
     }
 
     async fn fetch_http_video(
         &self,
         url: &str,
         cfg: VideoFetchConfig,
-    ) -> (u32, Result<Arc<VideoClip>, MediaConnectorError>) {
+    ) -> (FetchStats, Result<Arc<VideoClip>, MediaConnectorError>) {
         let parsed = match Url::parse(url) {
             Ok(parsed) => parsed,
-            Err(_) => return (1, Err(MediaConnectorError::InvalidUrl(url.to_string()))),
+            Err(_) => {
+                return (
+                    FetchStats::without_cache(1),
+                    Err(MediaConnectorError::InvalidUrl(url.to_string())),
+                );
+            }
         };
 
         let _slot = self.fetch_slot().await;
+        let started = Instant::now();
         let (attempts, bytes) = self
             .fetch_http_bytes_retried(
                 &parsed,
@@ -789,6 +825,7 @@ impl MediaConnector {
                 "video",
             )
             .await;
+        let stats = FetchStats::without_cache(attempts).with_download(started.elapsed());
         let clip = match bytes {
             Ok(bytes) => {
                 self.decode_video(
@@ -802,19 +839,25 @@ impl MediaConnector {
             }
             Err(error) => Err(error),
         };
-        (attempts, clip)
+        (stats, clip)
     }
 
     async fn fetch_http_audio(
         &self,
         url: &str,
-    ) -> (u32, Result<Arc<AudioClip>, MediaConnectorError>) {
+    ) -> (FetchStats, Result<Arc<AudioClip>, MediaConnectorError>) {
         let parsed = match Url::parse(url) {
             Ok(parsed) => parsed,
-            Err(_) => return (1, Err(MediaConnectorError::InvalidUrl(url.to_string()))),
+            Err(_) => {
+                return (
+                    FetchStats::without_cache(1),
+                    Err(MediaConnectorError::InvalidUrl(url.to_string())),
+                );
+            }
         };
 
         let _slot = self.fetch_slot().await;
+        let started = Instant::now();
         let (attempts, bytes) = self
             .fetch_http_bytes_retried(
                 &parsed,
@@ -823,6 +866,7 @@ impl MediaConnector {
                 "audio",
             )
             .await;
+        let stats = FetchStats::without_cache(attempts).with_download(started.elapsed());
         let clip = match bytes {
             Ok(bytes) => {
                 self.decode_audio(
@@ -835,7 +879,7 @@ impl MediaConnector {
             }
             Err(error) => Err(error),
         };
-        (attempts, clip)
+        (stats, clip)
     }
 
     /// [`Self::fetch_http_bytes`], retried up to `fetch_retries` times when
@@ -961,44 +1005,35 @@ impl MediaConnector {
         &self,
         path: &Path,
         cfg: VideoFetchConfig,
-    ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
-        let bytes = read_file_with_limit(&canonical, video_max_input_bytes(), "video").await?;
-        self.decode_video(bytes, cfg, VideoSource::File { path: canonical })
-            .await
+    ) -> (Duration, Result<Arc<VideoClip>, MediaConnectorError>) {
+        let started = Instant::now();
+        let file = self.read_media_file(path, video_max_input_bytes(), "video").await;
+        let download = started.elapsed();
+        let clip = match file {
+            Ok((canonical, bytes)) => {
+                self.decode_video(bytes, cfg, VideoSource::File { path: canonical })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        (download, clip)
     }
 
-    async fn fetch_audio_file(&self, path: &Path) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
-        let bytes = read_file_with_limit(&canonical, audio_max_input_bytes(), "audio").await?;
-        self.decode_audio(bytes, AudioSource::File { path: canonical })
-            .await
+    async fn fetch_audio_file(
+        &self,
+        path: &Path,
+    ) -> (Duration, Result<Arc<AudioClip>, MediaConnectorError>) {
+        let started = Instant::now();
+        let file = self.read_media_file(path, audio_max_input_bytes(), "audio").await;
+        let download = started.elapsed();
+        let clip = match file {
+            Ok((canonical, bytes)) => {
+                self.decode_audio(bytes, AudioSource::File { path: canonical })
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        (download, clip)
     }
 
     fn decode_image(
