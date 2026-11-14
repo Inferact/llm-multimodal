@@ -111,12 +111,19 @@ pub struct AlignedLongSide {
     /// The per-clip long-side cap a request set (see
     /// [`super::qwen_vl_base::QwenVLProcessorBase::with_video_long_side_override`]).
     pub(crate) video_long_side_override: Option<u32>,
+    /// The image long-side cap a request set (see
+    /// [`super::qwen_vl_base::QwenVLProcessorBase::with_image_long_side_override`]).
+    pub(crate) image_long_side_override: Option<u32>,
 }
 
 impl AlignedLongSide {
-    /// The long-side cap images are aligned under.
+    /// The long-side cap images are aligned under: a request's cap, clamped
+    /// to the `high` tier as the reference clamps it, then the
+    /// configuration's explicit cap, then the detail tier.
     pub fn image_long_side(&self) -> u32 {
-        self.image_max_long_side_pixel
+        self.image_long_side_override
+            .map(|cap| cap.min(self.image_caps.high))
+            .or(self.image_max_long_side_pixel)
             .unwrap_or_else(|| self.image_caps.for_detail(self.detail))
     }
 
@@ -528,6 +535,7 @@ pub fn minimax_m31_aligned() -> AlignedLongSide {
         video_max_long_side_pixel: None,
         video_max_total_pixels: 301_056_000,
         video_long_side_override: None,
+        image_long_side_override: None,
     }
 }
 
@@ -628,6 +636,12 @@ mod tests {
         assert_eq!(policy.video_long_side(), 1008);
         policy.video_long_side_override = Some(504);
         assert_eq!(policy.video_long_side(), 504);
+        // A request's image cap wins over the explicit one, clamped to the
+        // high tier.
+        policy.image_long_side_override = Some(504);
+        assert_eq!(policy.image_long_side(), 504);
+        policy.image_long_side_override = Some(999_999);
+        assert_eq!(policy.image_long_side(), 3584);
     }
 
     fn config_with_policy(value: serde_json::Value) -> PreProcessorConfig {
