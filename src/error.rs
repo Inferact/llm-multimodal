@@ -13,6 +13,13 @@ pub enum TransformError {
         actual: Vec<usize>,
     },
 
+    /// An image or frame whose long side is more than `max` times its short
+    /// side: the input's shape, not a processor's fault. The message is the
+    /// reference's (`compute_aligned_size` in vLLM's vendored
+    /// `minimax_m3.py`), so a client of either stack reads the same refusal.
+    #[error("absolute aspect ratio must be smaller than {max}, got {ratio:?}")]
+    AspectRatio { ratio: f64, max: u32 },
+
     #[error("Empty batch: cannot stack zero tensors")]
     EmptyBatch,
 

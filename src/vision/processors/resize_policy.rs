@@ -162,9 +162,9 @@ impl AlignedLongSide {
         }
         let ratio = height.max(width) as f64 / height.min(width) as f64;
         if ratio > f64::from(self.max_ratio) {
-            return Err(TransformError::InvalidShape {
-                expected: format!("aspect ratio < {}:1", self.max_ratio),
-                actual: vec![height, width],
+            return Err(TransformError::AspectRatio {
+                ratio,
+                max: self.max_ratio,
             });
         }
 
@@ -595,6 +595,39 @@ mod tests {
         assert!(policy.aligned_size(100, 0, 28, 2016).is_err());
         assert!(policy.aligned_size(1, 201, 28, 2016).is_err());
         assert!(policy.aligned_size(1, 200, 28, 2016).is_ok());
+    }
+
+    #[test]
+    fn an_extreme_ratio_is_the_clients_error_worded_as_the_reference_words_it() {
+        // The reference (vLLM's `compute_aligned_size`) raises only past the
+        // limit and prints the ratio as a Python float.
+        let policy = policy();
+        for (height, width) in [(1, 2000), (2000, 1)] {
+            let err = policy.aligned_size(height, width, 28, 2016).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TransformError::AspectRatio {
+                        ratio: 2000.0,
+                        max: 200
+                    }
+                ),
+                "{height}x{width}: {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "absolute aspect ratio must be smaller than 200, got 2000.0"
+            );
+        }
+        // A non-integer ratio prints the same way (`{:?}` on an f64).
+        let err = policy.aligned_size(2, 401, 28, 2016).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "absolute aspect ratio must be smaller than 200, got 200.5"
+        );
+        // Exactly at the limit is accepted, as the reference accepts it.
+        assert!(policy.aligned_size(1, 200, 28, 2016).is_ok());
+        assert!(policy.aligned_size(200, 1, 28, 2016).is_ok());
     }
 
     #[test]
