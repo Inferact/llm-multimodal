@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt,
     path::PathBuf,
@@ -502,6 +503,26 @@ impl ImageFrame {
                 self.transparency(),
             )
         })
+    }
+
+    /// The long-side cap the decode applies (MiniMax `max_long_side_pixel`),
+    /// which the frame's `hash` covers.
+    pub fn max_long_side_pixel(&self) -> Option<u32> {
+        self.max_long_side_pixel
+    }
+
+    /// The pixels without the long-side cap, for a processor that applies the
+    /// cap itself as its resize limit
+    /// ([`VisionPreProcessor::applies_image_long_side`](crate::vision::processor::VisionPreProcessor::applies_image_long_side)).
+    /// The `hash` still covers the cap, which changes that processor's
+    /// output. A frame without a cap gives its [`image`](Self::image).
+    pub fn image_without_long_side_cap(
+        &self,
+    ) -> Result<Cow<'_, DynamicImage>, MediaConnectorError> {
+        if self.max_long_side_pixel.is_none() {
+            return self.image().map(Cow::Borrowed);
+        }
+        decode_image_bytes(&self.raw_bytes, None, self.transparency()).map(Cow::Owned)
     }
 
     /// The transparency policy the decode applies (see [`TransparencyPolicy`]).
@@ -1015,6 +1036,29 @@ mod tests {
             ImageSize::new(2, 1),
             None,
         )
+    }
+
+    /// A capped frame decodes shrunk to the cap, and to its full size where
+    /// the processor applies the cap itself.
+    #[test]
+    fn image_without_long_side_cap_skips_the_shrink() {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(112, 56)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode");
+        let frame = ImageFrame::encoded(
+            encoded.into_inner().into(),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(56, 28),
+            Some(56),
+        );
+        assert_eq!(frame.max_long_side_pixel(), Some(56));
+        let full = frame.image_without_long_side_cap().expect("decode");
+        assert_eq!((full.width(), full.height()), (112, 56));
+        let capped = frame.image().expect("decode");
+        assert_eq!((capped.width(), capped.height()), (56, 28));
     }
 
     #[test]

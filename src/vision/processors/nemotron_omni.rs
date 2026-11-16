@@ -542,7 +542,13 @@ mod tests {
         let images = vec![DynamicImage::new_rgb8(640, 480); 2];
         let preprocess = |images: &[DynamicImage], token_budget| {
             NemotronOmniProcessor::new()
-                .preprocess_with_context(images, &VisionPreprocessingContext { token_budget })
+                .preprocess_with_context(
+                    images,
+                    &VisionPreprocessingContext {
+                        token_budget,
+                        ..Default::default()
+                    },
+                )
                 .unwrap()
         };
         let grids = |out: &PreprocessedEncoderInputs| match out.model_specific.get("image_grid_hw")

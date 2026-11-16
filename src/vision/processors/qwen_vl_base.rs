@@ -420,6 +420,16 @@ impl QwenVLProcessorBase {
         self
     }
 
+    /// This processor with a request's image long-side cap for the aligned
+    /// resize policy (a request's `max_long_side_pixel`); a no-op under the
+    /// smart resize policy.
+    pub(super) fn with_image_long_side_override(mut self, cap: Option<u32>) -> Self {
+        if let QwenResizePolicy::AlignedLongSide(policy) = &mut self.config.resize_policy {
+            policy.image_long_side_override = cap;
+        }
+        self
+    }
+
     /// The resize policy this processor picks targets with.
     pub fn resize_policy(&self) -> &QwenResizePolicy {
         &self.config.resize_policy

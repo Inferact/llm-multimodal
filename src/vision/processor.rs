@@ -72,6 +72,12 @@ pub struct VisionPreprocessingContext {
     /// caller that sets it preprocesses a request's images in one call.
     /// `None` sizes each image as if it were alone.
     pub token_budget: Option<usize>,
+    /// The request's image long-side cap (MiniMax `max_long_side_pixel`),
+    /// read only by a processor that applies it as its own resize limit
+    /// ([`VisionPreProcessor::applies_image_long_side`]). The caller then
+    /// hands that processor images not shrunk to the cap
+    /// ([`ImageFrame::image_without_long_side_cap`](crate::ImageFrame::image_without_long_side_cap)).
+    pub image_long_side: Option<u32>,
 }
 
 /// What a video preprocessor reads about one clip besides its frames.
@@ -153,6 +159,14 @@ pub trait VisionPreProcessor: Send + Sync {
         &self,
         images: &[DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
+
+    /// Whether this processor applies a request's image long-side cap
+    /// ([`VisionPreprocessingContext::image_long_side`]) as its own resize
+    /// limit, as MiniMax-M3's reference processor does, instead of being
+    /// handed images already shrunk to it.
+    fn applies_image_long_side(&self) -> bool {
+        false
+    }
 
     /// [`preprocess`](Self::preprocess) under a request's context. A processor
     /// whose output does not depend on the request keeps this default, which

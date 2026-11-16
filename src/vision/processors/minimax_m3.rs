@@ -55,7 +55,10 @@ use crate::{
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
-        processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
+        processor::{
+            PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
+            VisionPreprocessingContext,
+        },
         transforms::{resize, resize_bicubic_torch_aa, TransformError},
     },
 };
@@ -476,6 +479,33 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
             .map(|image| (image.width(), image.height()))
             .collect();
         Ok(out)
+    }
+
+    /// Under the aligned policy a request's image cap is the resize limit
+    /// itself, as in the reference (`resolve_max_long_side_pixel`).
+    fn applies_image_long_side(&self) -> bool {
+        matches!(
+            self.inner.resize_policy(),
+            QwenResizePolicy::AlignedLongSide(_)
+        )
+    }
+
+    fn preprocess_with_context(
+        &self,
+        images: &[DynamicImage],
+        context: &VisionPreprocessingContext,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        match context
+            .image_long_side
+            .filter(|_| self.applies_image_long_side())
+        {
+            Some(cap) => {
+                let mut processor = self.clone();
+                processor.inner = processor.inner.with_image_long_side_override(Some(cap));
+                processor.preprocess(images)
+            }
+            None => self.preprocess(images),
+        }
     }
 
     fn preprocess_video(
@@ -1399,6 +1429,27 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    /// Under the aligned policy a request's image cap is the resize limit
+    /// itself, as in the reference: 4000x3000 under 1008 aligns to 1008x784,
+    /// where an image shrunk to 1008x756 first would stay 1008x756. The smart
+    /// resize policy leaves the cap to the caller.
+    #[test]
+    fn a_request_image_cap_is_the_aligned_resize_limit() {
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        assert!(processor.applies_image_long_side());
+        let out = processor
+            .preprocess_with_context(
+                &[DynamicImage::new_rgb8(4000, 3000)],
+                &VisionPreprocessingContext {
+                    image_long_side: Some(1008),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(out.feature_token_counts, vec![1008]); // 1008x784
+        assert!(!smart_processor().applies_image_long_side());
     }
 
     #[test]
