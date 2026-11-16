@@ -55,8 +55,9 @@ pub enum MediaConnectorError {
     #[error("media domain '{0}' is not in the allow list")]
     DisallowedDomain(String),
     /// The host names or resolves to an address media is not fetched from
-    /// (loopback, link-local, private, shared address space, unspecified,
-    /// multicast, broadcast) and private media hosts are not allowed.
+    /// (loopback, link-local, private, shared address space, the
+    /// documentation ranges, unspecified, multicast, broadcast) and private
+    /// media hosts are not allowed.
     #[error(
         "media host '{host}' resolves to {address}, a {class} address, which media is not \
          fetched from unless private media hosts are allowed"

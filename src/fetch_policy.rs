@@ -1,12 +1,14 @@
 //! Which hosts a client-supplied media URL may be fetched from.
 //!
-//! Two rules, checked on every hop of a fetch (the URL the request named and
-//! each redirect target): an optional allow-list of host names, and an
-//! address policy that refuses a host that names or resolves to an address
-//! that is not public (loopback, link-local, private, shared address space,
-//! unspecified, multicast, broadcast) unless the deployment allows internal
-//! media origins. The address policy is judged on the addresses the host
-//! resolves to, and the connection goes to those same addresses: the
+//! Three rules, checked on every hop of a fetch (the URL the request named
+//! and each redirect target): an optional refusal of `http://` outright, for
+//! a deployment that fetches media over TLS only; an optional allow-list of
+//! host names; and an address policy that refuses a host that names or
+//! resolves to an address that is not public (loopback, link-local, private,
+//! shared address space, the documentation ranges, unspecified, multicast,
+//! broadcast) unless the deployment allows internal media origins. The
+//! address policy is judged on the addresses the host resolves to, and the
+//! connection goes to those same addresses: the
 //! connector resolves the host, checks every address, and pins the answer for
 //! the HTTP client's resolver for as long as the hop is in flight
 //! ([`MediaHostResolver`]), so a DNS answer cannot change between the check
@@ -35,6 +37,8 @@ pub(crate) struct MediaHostPolicy {
     allowed_domains: Option<HashSet<String>>,
     /// Whether a host may name or resolve to a non-public address.
     allow_private_hosts: bool,
+    /// Whether a URL may be `http://`; off, only `https://` is fetched.
+    allow_http: bool,
 }
 
 /// An allow-list as the policy reads it: each entry trimmed and lowercased,
@@ -59,12 +63,29 @@ pub fn effective_allowed_domains(allowed_domains: Option<&[String]>) -> Option<V
 impl MediaHostPolicy {
     /// `allowed_domains` by name, as [`effective_allowed_domains`] reads it:
     /// decided here, once, for every way a list arrives.
-    pub(crate) fn new(allowed_domains: Option<Vec<String>>, allow_private_hosts: bool) -> Self {
+    pub(crate) fn new(
+        allowed_domains: Option<Vec<String>>,
+        allow_private_hosts: bool,
+        allow_http: bool,
+    ) -> Self {
         Self {
             allowed_domains: effective_allowed_domains(allowed_domains.as_deref())
                 .map(|domains| domains.into_iter().collect::<HashSet<String>>()),
             allow_private_hosts,
+            allow_http,
         }
+    }
+
+    /// The URL's scheme against the policy: with `allow_http` off an
+    /// `http://` URL is refused before anything is connected, on the URL the
+    /// request named and on every redirect target alike.
+    fn check_scheme(&self, url: &Url) -> Result<(), MediaConnectorError> {
+        if !self.allow_http && url.scheme() == "http" {
+            return Err(MediaConnectorError::UnsupportedScheme(
+                url.scheme().to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Whether hosts are judged by address at all. With private hosts
@@ -170,6 +191,13 @@ fn ipv4_class(address: Ipv4Addr) -> Option<&'static str> {
     } else if first == 192 && second == 0 && third == 0 {
         // 192.0.0.0/24, the IETF protocol assignments.
         Some("reserved")
+    } else if (first, second, third) == (192, 0, 2)
+        || (first, second, third) == (198, 51, 100)
+        || (first, second, third) == (203, 0, 113)
+    {
+        // 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24 (TEST-NET-1..3,
+        // RFC 5737): the documentation ranges, which no routable host has.
+        Some("documentation")
     } else if first == 198 && (second == 18 || second == 19) {
         // 198.18.0.0/15, the benchmarking range.
         Some("benchmarking")
@@ -225,8 +253,9 @@ struct Pin {
 }
 
 impl MediaHostResolver {
-    /// Admit one hop of a fetch under `policy`: the host by name against the
-    /// allow-list, then, when the policy checks addresses, its address (an
+    /// Admit one hop of a fetch under `policy`: the scheme against an
+    /// https-only deployment, the host by name against the allow-list,
+    /// then, when the policy checks addresses, its address (an
     /// IP literal) or every address it resolves to against the address
     /// policy. The guard keeps the checked addresses pinned for this resolver
     /// until the hop is over, so the client connects to what was checked. A
@@ -237,6 +266,7 @@ impl MediaHostResolver {
         policy: &MediaHostPolicy,
         url: &Url,
     ) -> Result<HostPin, MediaConnectorError> {
+        policy.check_scheme(url)?;
         let name = policy.check_name(url)?;
         if !policy.checks_addresses() {
             return Ok(HostPin { pinned: None });
@@ -418,6 +448,13 @@ mod tests {
             ("255.255.255.255", "broadcast"),
             ("192.0.0.1", "reserved"),
             ("192.0.0.255", "reserved"),
+            // The documentation ranges (TEST-NET-1..3, RFC 5737).
+            ("192.0.2.1", "documentation"),
+            ("192.0.2.255", "documentation"),
+            ("198.51.100.1", "documentation"),
+            ("198.51.100.255", "documentation"),
+            ("203.0.113.1", "documentation"),
+            ("203.0.113.255", "documentation"),
             ("198.18.0.1", "benchmarking"),
             ("198.19.255.255", "benchmarking"),
             ("240.0.0.1", "reserved"),
@@ -481,6 +518,11 @@ mod tests {
             "64:ff9b:1::5db8:d822",
             "2002:5db8:d822::1",
             "192.0.1.0",
+            "192.0.3.0",
+            "198.51.99.255",
+            "198.51.101.0",
+            "203.0.112.255",
+            "203.0.114.0",
             "198.17.255.255",
             "198.20.0.0",
             "223.255.255.255",
@@ -494,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn the_allow_list_and_the_address_policy_each_refuse_their_own() {
         let resolver = Arc::new(MediaHostResolver::default());
-        let listed = MediaHostPolicy::new(Some(vec!["Media.Example".to_string()]), true);
+        let listed = MediaHostPolicy::new(Some(vec!["Media.Example".to_string()]), true, true);
         let url = Url::parse("http://media.example/a.png").expect("url");
         // A listed name whose address is public cannot be resolved here, so
         // the name check is observed through an unlisted one.
@@ -510,7 +552,7 @@ mod tests {
         ));
         drop(url);
 
-        let any = MediaHostPolicy::new(None, false);
+        let any = MediaHostPolicy::new(None, false, true);
         let error = resolver
             .admit(&any, &literal)
             .await
@@ -531,12 +573,73 @@ mod tests {
                 ..
             })
         ));
-        let allowed = MediaHostPolicy::new(None, true);
+        let allowed = MediaHostPolicy::new(None, true, true);
         let pin = resolver
             .admit(&allowed, &literal)
             .await
             .expect("private hosts allowed");
         assert!(pin.pinned.is_none(), "a literal needs no pin");
+    }
+
+    /// With `http` refused, the scheme is judged before the name and the
+    /// address: an `http://` hop is the scheme's refusal even where the
+    /// address would fail its own check, so nothing is looked up or
+    /// connected for it; `https://` passes the scheme check, and the
+    /// default policy admits `http` as before.
+    #[tokio::test]
+    async fn https_only_refuses_http_before_the_name_and_the_address() {
+        let resolver = Arc::new(MediaHostResolver::default());
+        resolver.answer("media.example", vec![ip("93.184.216.34")]);
+        resolver.answer("blocked.example", vec![ip("127.0.0.1")]);
+        let https_only = MediaHostPolicy::new(None, false, false);
+
+        let url = Url::parse("http://blocked.example/a.png").expect("url");
+        let error = resolver
+            .admit(&https_only, &url)
+            .await
+            .expect_err("http is refused before the loopback answer is judged");
+        assert!(
+            matches!(&error, MediaConnectorError::UnsupportedScheme(scheme) if scheme == "http"),
+            "{error}"
+        );
+
+        let url = Url::parse("https://media.example/a.png").expect("url");
+        resolver
+            .admit(&https_only, &url)
+            .await
+            .expect("https passes the scheme check");
+
+        let default = MediaHostPolicy::new(None, false, true);
+        let url = Url::parse("http://media.example/a.png").expect("url");
+        resolver
+            .admit(&default, &url)
+            .await
+            .expect("the default policy admits http");
+    }
+
+    /// A documentation-range literal is refused like any other non-public
+    /// address, its class naming the range's kind; a public literal passes.
+    #[tokio::test]
+    async fn a_documentation_range_literal_is_refused() {
+        let resolver = Arc::new(MediaHostResolver::default());
+        let any = MediaHostPolicy::new(None, false, true);
+        for address in ["192.0.2.1", "198.51.100.1", "203.0.113.1"] {
+            let url = Url::parse(&format!("http://{address}/a.png")).expect("url");
+            let error = resolver.admit(&any, &url).await.expect_err("refused");
+            assert!(
+                matches!(
+                    &error,
+                    MediaConnectorError::DisallowedAddress { host, class: "documentation", .. }
+                        if host == address
+                ),
+                "{address}: {error}"
+            );
+        }
+        let url = Url::parse("http://8.8.8.8/a.png").expect("url");
+        resolver
+            .admit(&any, &url)
+            .await
+            .expect("a public literal passes");
     }
 
     /// A name is judged on the addresses it resolves to; the addresses a hop
@@ -546,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn a_resolved_name_is_judged_and_pinned_for_the_client() {
         let resolver = Arc::new(MediaHostResolver::default());
-        let any = MediaHostPolicy::new(None, false);
+        let any = MediaHostPolicy::new(None, false, true);
         let url = Url::parse("http://localhost:8080/a.png").expect("url");
         let error = resolver
             .admit(&any, &url)
@@ -603,7 +706,7 @@ mod tests {
         let host = format!("{}.invalid", "a".repeat(64));
         let url = Url::parse(&format!("http://{host}/a.png")).expect("url");
 
-        let strict = MediaHostPolicy::new(None, false);
+        let strict = MediaHostPolicy::new(None, false, true);
         let error = resolver
             .admit(&strict, &url)
             .await
@@ -613,7 +716,7 @@ mod tests {
             "{error}"
         );
 
-        let open = MediaHostPolicy::new(None, true);
+        let open = MediaHostPolicy::new(None, true, true);
         let pin = resolver
             .admit(&open, &url)
             .await
@@ -622,7 +725,7 @@ mod tests {
         assert!(resolver.pinned(&host).is_none());
 
         // The allow-list still holds, by name.
-        let listed = MediaHostPolicy::new(Some(vec!["media.example".to_string()]), true);
+        let listed = MediaHostPolicy::new(Some(vec!["media.example".to_string()]), true, true);
         assert!(matches!(
             resolver.admit(&listed, &url).await,
             Err(MediaConnectorError::DisallowedDomain(named)) if named == host
@@ -636,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn a_public_name_is_admitted_and_its_checked_addresses_pinned() {
         let resolver = Arc::new(MediaHostResolver::default());
-        let strict = MediaHostPolicy::new(None, false);
+        let strict = MediaHostPolicy::new(None, false, true);
         let checked = vec![
             ip("93.184.216.34"),
             ip("2606:2800:21f:cb07:6820:80da:af6b:8b2c"),
@@ -696,7 +799,7 @@ mod tests {
         assert_eq!(effective_allowed_domains(Some(&blank)), None);
         assert_eq!(effective_allowed_domains(Some(&[])), None);
         assert_eq!(effective_allowed_domains(None), None);
-        let policy = MediaHostPolicy::new(Some(spelled), false);
+        let policy = MediaHostPolicy::new(Some(spelled), false, true);
         assert_eq!(
             policy.allowed_domains,
             Some(HashSet::from([
@@ -722,6 +825,7 @@ mod tests {
                 "  ".to_string(),
             ]),
             true,
+            true,
         );
         for host in ["media.example", "cdn.example", "CDN.example"] {
             let url = Url::parse(&format!("http://{host}/a.png")).expect("url");
@@ -741,7 +845,7 @@ mod tests {
             vec![String::new()],
             vec![" ".to_string(), String::new()],
         ] {
-            let unlisted = MediaHostPolicy::new(Some(blank.clone()), true);
+            let unlisted = MediaHostPolicy::new(Some(blank.clone()), true, true);
             assert!(
                 unlisted.allowed_domains.is_none(),
                 "{blank:?} names no host: no allow-list"

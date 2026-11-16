@@ -123,6 +123,12 @@ pub struct MediaConnectorConfig {
     /// resolved by the HTTP client as before, through an egress proxy where
     /// there is one.
     pub allow_private_hosts: bool,
+    /// Whether media may be fetched over plain `http`. On (the default), an
+    /// `http://` URL is fetched as before; off, one is refused before
+    /// anything is connected — the URL the request named and every redirect
+    /// target alike — as [`MediaConnectorError::UnsupportedScheme`], the
+    /// request's fault, for a deployment that fetches media over TLS only.
+    pub allow_http: bool,
     pub allowed_local_media_path: Option<PathBuf>,
     /// Budget for one image or audio fetch by URL, connect to last byte;
     /// zero leaves only the HTTP client's own timeout.
@@ -165,6 +171,7 @@ impl Default for MediaConnectorConfig {
         Self {
             allowed_domains: None,
             allow_private_hosts: false,
+            allow_http: true,
             allowed_local_media_path: None,
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             video_fetch_timeout: DEFAULT_VIDEO_FETCH_TIMEOUT,
@@ -465,6 +472,7 @@ impl MediaConnector {
         let policy = Arc::new(MediaHostPolicy::new(
             config.allowed_domains,
             config.allow_private_hosts,
+            config.allow_http,
         ));
         let resolver = Arc::new(MediaHostResolver::default());
         let client = client
