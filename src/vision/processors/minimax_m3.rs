@@ -1155,18 +1155,19 @@ mod tests {
     }
 
     #[test]
-    fn off_contract_aspect_ratios_are_still_rejected_with_the_callers_dimensions() {
+    fn off_contract_aspect_ratios_are_still_rejected_with_the_callers_ratio() {
         // Raising keeps the aspect ratio, so the base's guard fires for the
-        // same inputs as before and names the dimensions the caller sent.
+        // same inputs as before and reports the ratio the caller's
+        // dimensions make, worded as the reference words it.
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
-        for (width, height) in [(201, 1), (2, 500), (30_000, 100)] {
+        for (width, height, ratio) in [(201, 1, 201.0), (2, 500, 250.0), (30_000, 100, 300.0)] {
             let err = processor
                 .preprocess(&[DynamicImage::new_rgb8(width, height)])
                 .expect_err("aspect ratio above 200:1 is rejected");
-            let TransformError::InvalidShape { actual, .. } = err else {
+            let TransformError::AspectRatio { ratio: got, max } = err else {
                 panic!("{width}x{height}: {err}");
             };
-            assert_eq!(actual, vec![height as usize, width as usize]);
+            assert_eq!((got, max), (ratio, 200), "{width}x{height}");
         }
     }
 
@@ -1179,10 +1180,10 @@ mod tests {
             DynamicImage::new_rgb8(50, 50),
         ];
         let err = processor.preprocess(&images).expect_err("rejected");
-        let TransformError::InvalidShape { actual, .. } = err else {
-            panic!("{err}");
-        };
-        assert_eq!(actual, vec![30_000, 112]);
+        assert!(
+            matches!(err, TransformError::AspectRatio { max: 200, .. }),
+            "{err}"
+        );
     }
 
     #[test]

@@ -649,9 +649,9 @@ impl QwenVLProcessorBase {
         let min_dim = height.min(width) as f64;
         let aspect_ratio = max_dim / min_dim;
         if aspect_ratio > 200.0 {
-            return Err(TransformError::InvalidShape {
-                expected: "aspect ratio < 200:1".to_string(),
-                actual: vec![height, width],
+            return Err(TransformError::AspectRatio {
+                ratio: aspect_ratio,
+                max: 200,
             });
         }
 
@@ -741,9 +741,9 @@ impl QwenVLProcessorBase {
         let min_dim = height.min(width) as f64;
         let aspect_ratio = max_dim / min_dim;
         if aspect_ratio > 200.0 {
-            return Err(TransformError::InvalidShape {
-                expected: "aspect ratio < 200:1".to_string(),
-                actual: vec![height, width],
+            return Err(TransformError::AspectRatio {
+                ratio: aspect_ratio,
+                max: 200,
             });
         }
 
@@ -2524,6 +2524,58 @@ mod tests {
         let processor = QwenVLProcessorBase::new(create_test_config());
         let result = processor.smart_resize(100, 30000);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn smart_resize_reports_an_extreme_ratio_as_the_reference_words_it() {
+        let processor = QwenVLProcessorBase::new(create_test_config());
+        for (height, width) in [(1, 2000), (2000, 1)] {
+            let err = processor.smart_resize(height, width).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TransformError::AspectRatio {
+                        ratio: 2000.0,
+                        max: 200
+                    }
+                ),
+                "{height}x{width}: {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "absolute aspect ratio must be smaller than 200, got 2000.0"
+            );
+        }
+        // Exactly at the limit is accepted, as the reference accepts it.
+        assert!(processor.smart_resize(1, 200).is_ok());
+        assert!(processor.smart_resize(200, 1).is_ok());
+    }
+
+    #[test]
+    fn smart_resize_video_reports_an_extreme_ratio_as_the_reference_words_it() {
+        // Below-factor dimensions are allowed here so the aspect guard is
+        // what a 1x2000 clip trips on.
+        let processor =
+            QwenVLProcessorBase::new(create_test_config()).allow_video_dimensions_below_factor();
+        for (height, width) in [(1, 2000), (2000, 1)] {
+            let err = processor.smart_resize_video(2, height, width).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    TransformError::AspectRatio {
+                        ratio: 2000.0,
+                        max: 200
+                    }
+                ),
+                "{height}x{width}: {err}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "absolute aspect ratio must be smaller than 200, got 2000.0"
+            );
+        }
+        assert!(processor.smart_resize_video(2, 1, 200).is_ok());
+        assert!(processor.smart_resize_video(2, 200, 1).is_ok());
     }
 
     #[test]
