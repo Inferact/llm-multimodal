@@ -129,6 +129,43 @@ async fn a_url_outside_the_allow_list_is_refused_before_connecting() {
     );
 }
 
+/// With `allow_http` off an `http://` URL is refused before anything is
+/// connected: the origin sees no request. The default policy fetches it.
+#[tokio::test]
+async fn https_only_refuses_an_http_url_before_connecting() {
+    let (port, hits) = serve_png();
+    let url = format!("http://127.0.0.1:{port}/img.png");
+    let https_only = MediaConnector::new(
+        common::http_client_builder().no_proxy(),
+        MediaConnectorConfig {
+            allow_private_hosts: true,
+            allow_http: false,
+            fetch_timeout: Duration::from_secs(5),
+            ..MediaConnectorConfig::default()
+        },
+    )
+    .expect("media connector");
+    let error = fetch(&https_only, url.clone())
+        .await
+        .expect_err("http is refused when only https is allowed");
+    assert!(
+        matches!(&error, MediaConnectorError::UnsupportedScheme(scheme) if scheme == "http"),
+        "{error}"
+    );
+    assert_eq!(error.fault(), MediaFault::Client);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the origin must not be contacted"
+    );
+
+    // The default policy fetches the same URL.
+    fetch(&connector(None, true), url)
+        .await
+        .expect("the default policy allows http");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
 /// A redirect from an allow-listed host to a host outside the list is
 /// refused, naming the target; the target sees no request.
 #[tokio::test]
